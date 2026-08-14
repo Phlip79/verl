@@ -29,7 +29,7 @@ install_requires = [
     "datasets",
     "dill",
     "hydra-core",
-    "numpy<2.0.0",
+    "numpy>=2.0.0",
     "pandas",
     "peft",
     "pyarrow>=19.0.0",
@@ -38,7 +38,10 @@ install_requires = [
     "ray[default]>=2.41.0",
     "torchdata",
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
-    "transformers",
+    # vLLM 0.27.1 requires Transformers >=5.5.3, while Megatron-Bridge 0.6.0
+    # supports Transformers through 5.12.1. Keep the same tested Transformers
+    # 5 window as upstream main.
+    "transformers>=5.5.3,!=5.6.0,<5.11",
     "wandb",
     "packaging>=20.0",
     "tensorboard",
@@ -49,14 +52,17 @@ PRIME_REQUIRES = ["pyext"]
 GEO_REQUIRES = ["mathruler", "torchvision", "qwen_vl_utils"]
 GPU_REQUIRES = ["liger-kernel", "flash-attn"]
 MATH_REQUIRES = ["math-verify"]  # Add math-verify as an optional dependency
-VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.10.0,!=0.9.0", "vllm>=0.8.5,<=0.12.0"]
+VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.10.0,!=0.9.0", "vllm>=0.18.0"]
 SGLANG_REQUIRES = [
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
     "sglang[srt,openai]==0.5.6",
     "torch==2.9.1",
 ]
 TRL_REQUIRES = ["trl<=0.9.6"]
-MCORE_REQUIRES = ["mbridge"]
+# Keep the legacy mbridge dependency available during its deprecation window.
+# Native HybridModel MTP performs its stricter Bridge/Core version check only
+# when that feature is enabled.
+MCORE_REQUIRES = ["megatron-bridge", "mbridge"]
 TRANSFERQUEUE_REQUIRES = ["TransferQueue==0.1.5.dev3"]
 
 extras_require = {

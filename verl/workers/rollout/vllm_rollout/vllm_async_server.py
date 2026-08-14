@@ -30,6 +30,7 @@ from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
+from vllm.entrypoints.cli.serve import run_headless as run_vllm_headless
 from vllm.entrypoints.openai.api_server import (
     build_app,
     init_app_state,
@@ -39,13 +40,11 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.v1.engine.core import EngineCoreProc
-from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
 
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
+from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
@@ -54,6 +53,8 @@ from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
     VLLM_LORA_PATH,
+    SuppressSignalInThread,
+    build_mtp_speculative_config,
     get_vllm_max_lora_rank,
 )
 
@@ -61,14 +62,13 @@ _VLLM_VERSION = version.parse(vllm.__version__)
 
 if _VLLM_VERSION > version.parse("0.11.0"):
     from vllm.utils.argparse_utils import FlexibleArgumentParser
-    from vllm.utils.network_utils import get_tcp_uri
 
     if _VLLM_VERSION == version.parse("0.12.0"):
         from vllm.entrypoints.harmony_utils import get_encoding
 
         get_encoding()
 else:
-    from vllm.utils import FlexibleArgumentParser, get_tcp_uri
+    from vllm.utils import FlexibleArgumentParser
 if _VLLM_VERSION >= version.parse("0.12.0"):
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import ModelRunnerOutput
@@ -195,7 +195,14 @@ class vLLMHttpServerBase:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = self.model_config.hf_config.max_position_embeddings
+        model_max_len = self.model_config.hf_config.max_position_embeddings
+        if self.config.max_model_len is None:
+            self.config.max_model_len = model_max_len
+        elif self.config.max_model_len > model_max_len:
+            raise ValueError(
+                f"max_model_len ({self.config.max_model_len}) should be less than or equal to "
+                f"max_position_embeddings ({model_max_len})"
+            )
         self.rollout_mode = rollout_mode
         self.workers = workers
 
@@ -267,12 +274,25 @@ class vLLMHttpServerBase:
 
         quantization = self.config.quantization
 
+        if (
+            quantization is not None
+            and self.config.mtp is not None
+            and self.config.mtp.enable
+            and self.config.mtp.enable_rollout
+        ):
+            raise NotImplementedError(
+                "Quantized actor-to-vLLM MTP drafter synchronization is not supported; "
+                "use the BF16 Lightning checkpoint and rollout."
+            )
+
         if quantization is not None:
             _SUPPORTED_QUANTIZATION = ["fp8", "torchao"]
             if quantization not in _SUPPORTED_QUANTIZATION:
                 raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
 
             if quantization == "fp8":
+                from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
+
                 FP8_BLOCK_QUANT_KWARGS = {
                     "activation_scheme": "dynamic",
                     "fmt": "e4m3",
@@ -314,6 +334,13 @@ class vLLMHttpServerBase:
             "hf_overrides": hf_overrides,
             **engine_kwargs,
         }
+
+        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
+            args["speculative_config"] = build_mtp_speculative_config(
+                self.config.mtp.method,
+                self.config.mtp.num_speculative_tokens,
+                args.get("speculative_config"),
+            )
 
         if self.config.prometheus.enable:
             if self.config.prometheus.served_model_name:
@@ -420,11 +447,23 @@ class vLLMHttpServerBase:
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
 
-        app = build_app(args)
-        if _VLLM_VERSION > version.parse("0.11.0"):
-            await init_app_state(engine_client, app.state, args)
-        else:
+        build_app_sig = inspect.signature(build_app)
+        supported_tasks: tuple[Any, ...] = ()
+        build_app_kwargs = {}
+        if "supported_tasks" in build_app_sig.parameters:
+            supported_tasks = await engine_client.get_supported_tasks()
+            build_app_kwargs["supported_tasks"] = supported_tasks
+        if "model_config" in build_app_sig.parameters:
+            build_app_kwargs["model_config"] = engine_client.model_config
+        app = build_app(args, **build_app_kwargs)
+
+        init_app_sig = inspect.signature(init_app_state)
+        if "vllm_config" in init_app_sig.parameters:
             await init_app_state(engine_client, vllm_config, app.state, args)
+        elif "supported_tasks" in init_app_sig.parameters:
+            await init_app_state(engine_client, app.state, args, supported_tasks)
+        else:
+            await init_app_state(engine_client, app.state, args)
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
@@ -432,30 +471,27 @@ class vLLMHttpServerBase:
         self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
 
     async def run_headless(self, args: argparse.Namespace):
-        # Create the EngineConfig.
-        engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
-        usage_context = UsageContext.OPENAI_API_SERVER
-        vllm_config = engine_args.create_engine_config(usage_context=usage_context, headless=True)
+        """Run vLLM's supported headless entrypoint without blocking Ray."""
+        args.api_server_count = 0
 
-        parallel_config = vllm_config.parallel_config
-        local_engine_count = parallel_config.data_parallel_size_local
+        def run_headless_wrapper():
+            with SuppressSignalInThread():
+                run_vllm_headless(args)
 
-        host = parallel_config.data_parallel_master_ip
-        port = engine_args.data_parallel_rpc_port  # add to config too
-        handshake_address = get_tcp_uri(host, port)
+        def on_run_headless_done(future: asyncio.Future):
+            try:
+                exc = future.exception()
+                if exc:
+                    logger.exception(f"run_headless failed with exception: {exc}")
+                else:
+                    logger.warning("run_headless completed successfully, but it is expected to stay alive.")
+            except Exception as exc:
+                logger.exception(f"failed to retrieve run_headless result: {exc}")
+            finally:
+                os._exit(1)
 
-        # Create the engines.
-        self.engine_manager = CoreEngineProcManager(
-            target_fn=EngineCoreProc.run_engine_core,
-            local_engine_count=local_engine_count,
-            start_index=vllm_config.parallel_config.data_parallel_rank,
-            local_start_index=0,
-            vllm_config=vllm_config,
-            local_client=False,
-            handshake_address=handshake_address,
-            executor_class=Executor.get_class(vllm_config),
-            log_stats=not engine_args.disable_log_stats,
-        )
+        self.headless_task = asyncio.create_task(asyncio.to_thread(run_headless_wrapper))
+        self.headless_task.add_done_callback(on_run_headless_done)
 
     async def generate(
         self,
@@ -466,6 +502,8 @@ class vLLMHttpServerBase:
         video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        prompt_ids = normalize_token_ids(prompt_ids)
+
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound
         max_possible_tokens = self.config.max_model_len - len(prompt_ids)

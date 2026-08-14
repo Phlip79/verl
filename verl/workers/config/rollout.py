@@ -20,6 +20,7 @@ from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
+from verl.workers.config.model import MtpConfig
 
 __all__ = [
     "SamplingConfig",
@@ -218,6 +219,8 @@ class RolloutConfig(BaseConfig):
     enable_rollout_routing_replay: bool = False
 
     enable_sleep_mode: bool = True
+
+    mtp: MtpConfig = field(default_factory=MtpConfig)
 
     def __post_init__(self):
         """Validate the rollout config"""

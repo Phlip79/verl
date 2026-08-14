@@ -37,6 +37,8 @@ from verl.utils.megatron.tensor_parallel import (
     vocab_parallel_log_probs_from_logits,
 )
 from verl.utils.megatron_utils import (
+    check_mtp_config,
+    get_megatron_mtp_loss,
     load_megatron_model_to_gpu,
     load_megatron_optimizer,
     offload_megatron_model_to_cpu,
@@ -111,6 +113,8 @@ class MegatronEngine(BaseEngine):
         from verl.utils.megatron_utils import mapping_string_to_attn_backend
         from verl.utils.torch_dtypes import PrecisionType
 
+        check_mtp_config(self.model_config, self.engine_config)
+
         self.param_dtype = PrecisionType.to_dtype(self.engine_config.dtype)
         self.dtype = PrecisionType.to_dtype(self.param_dtype)
 
@@ -118,6 +122,7 @@ class MegatronEngine(BaseEngine):
 
         self.provider = None
         self.vanilla_bridge = self.engine_config.vanilla_mbridge
+
         if self.vanilla_bridge:
             from verl.models.mcore.mbridge import AutoBridge
 
@@ -136,31 +141,43 @@ class MegatronEngine(BaseEngine):
             # Get Megatron provider and configure it
             provider = bridge.to_megatron_provider(load_weights=False)
 
-            # In case of invalid overrides, we need to make sure some critical params are set correctly
-            provider.params_dtype = self.param_dtype
-
-            # Pass distributed info
-            provider.tensor_model_parallel_size = self.engine_config.tensor_model_parallel_size
-            provider.pipeline_model_parallel_size = self.engine_config.pipeline_model_parallel_size
-            provider.expert_model_parallel_size = self.engine_config.expert_model_parallel_size
-            provider.expert_tensor_parallel_size = self.engine_config.expert_tensor_parallel_size
-            provider.virtual_pipeline_model_parallel_size = self.engine_config.virtual_pipeline_model_parallel_size
-            provider.context_parallel_size = self.engine_config.context_parallel_size
-            provider.sequence_parallel = self.engine_config.sequence_parallel
-
             # Match verl implementation (need variable_seq_lengths)
             from megatron.core.transformer.enums import AttnBackend
 
-            provider.attention_backend = AttnBackend.flash
-            provider.variable_seq_lengths = True
-            provider.moe_token_dispatcher_type = "alltoall"
-            provider.moe_router_load_balancing_type = "none"
+            provider_overrides = {
+                "tensor_model_parallel_size": self.engine_config.tensor_model_parallel_size,
+                "pipeline_model_parallel_size": self.engine_config.pipeline_model_parallel_size,
+                "expert_model_parallel_size": self.engine_config.expert_model_parallel_size,
+                "expert_tensor_parallel_size": self.engine_config.expert_tensor_parallel_size,
+                "virtual_pipeline_model_parallel_size": self.engine_config.virtual_pipeline_model_parallel_size,
+                "context_parallel_size": self.engine_config.context_parallel_size,
+                "sequence_parallel": self.engine_config.sequence_parallel,
+                "overlap_p2p_comm": (
+                    self.engine_config.virtual_pipeline_model_parallel_size is not None
+                    and self.engine_config.virtual_pipeline_model_parallel_size > 1
+                ),
+                "batch_p2p_comm": False,
+                "attention_backend": AttnBackend.flash,
+                "variable_seq_lengths": True,
+                "moe_token_dispatcher_type": "alltoall",
+                "moe_router_load_balancing_type": "none",
+                **override_transformer_config,
+            }
 
-            # Apply transformer config overrides
-            for key, value in override_transformer_config.items():
-                setattr(provider, key, value)
+            from verl.models.mcore.mtp_support import configure_native_hybrid_mtp
 
-            provider.finalize()
+            configure_native_hybrid_mtp(provider, self.model_config.mtp, provider_overrides)
+
+            if hasattr(provider, "apply_overrides_and_finalize"):
+                provider.apply_overrides_and_finalize(dtype=self.param_dtype, overrides=provider_overrides)
+            else:
+                # Compatibility with the original release/v0.7.0 Bridge API.
+                provider.params_dtype = self.param_dtype
+                provider.fp16 = self.param_dtype == torch.float16
+                provider.bf16 = self.param_dtype == torch.bfloat16
+                for key, value in provider_overrides.items():
+                    setattr(provider, key, value)
+                provider.finalize()
             self.provider = provider
             tf_config = None  # Will be set after model creation
         self.bridge = bridge
@@ -529,15 +546,28 @@ class MegatronEngine(BaseEngine):
             micro_batch_size=1,  # the communication shape is obtained via p2p comm
             forward_only=forward_only,
         )
+
+        if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
+            # All DP/CP ranks must participate in the tracker reduction. Only
+            # the model-parallel output source publishes the resulting metric.
+            metrics = get_megatron_mtp_loss(n_micro_batch)
+            if self.is_mp_src_rank_with_outputs():
+                if "metrics" not in losses_reduced[0]:
+                    losses_reduced[0]["metrics"] = {}
+                losses_reduced[0]["metrics"].update(metrics)
+
         # loss_reduces contains the stats returned from loss_func
         if mpu.is_pipeline_last_stage(ignore_virtual=True):
             return postprocess_batch_func(output_lst=losses_reduced, indices=indices, data=data)
         else:
             return {}
 
-    def get_per_tensor_param(self):
+    def get_per_tensor_param(self, **kwargs):
         load_megatron_model_to_gpu(self.module, load_grad=False)
-        per_tensor_param = self.bridge.export_weights(self.module)
+        if self.vanilla_bridge:
+            per_tensor_param = self.bridge.export_weights(self.module)
+        else:
+            per_tensor_param = self.bridge.export_hf_weights(self.module)
         # TODO: support megatron LoRA
         return per_tensor_param, None
 
@@ -589,6 +619,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
         return {
             "input_ids": input_ids,
+            "attention_mask": batch.get("attention_mask", None),
             "loss_mask": loss_mask,
             "multi_modal_inputs": multi_modal_inputs,
         }
@@ -614,7 +645,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
         model_inputs = self.prepare_model_inputs(batch)
         input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
         multi_modal_inputs = model_inputs["multi_modal_inputs"]
+        loss_mask = model_inputs["loss_mask"]
 
         if pad_mode == DatasetPadMode.NO_PADDING:
             label = input_ids.clone()
@@ -650,7 +683,16 @@ class MegatronEngineWithLMHead(MegatronEngine):
             ret["log_probs"] = log_probs
             return ret
 
-        logits_processor_args = {"label": label}
+        # Temperature is consumed from the closure in this release. loss_mask
+        # is removed by the MTP-aware forward wrapper before logits_processor.
+        response_attention_mask = None
+        if attention_mask is not None and not loss_mask.is_nested:
+            response_attention_mask = attention_mask[:, -loss_mask.shape[-1] :]
+        logits_processor_args = {
+            "label": label,
+            "loss_mask": loss_mask,
+            "response_attention_mask": response_attention_mask,
+        }
 
         output = forward_fn(
             model,
@@ -661,6 +703,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
             vision_model=hasattr(self.model_config.hf_config, "vision_config"),
             pad_token_id=self.model_config.tokenizer.pad_token_id,
             data_format="thd" if self.engine_config.use_remove_padding else "bshd",
+            mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
         )
 
         return output, partial(postprocess_micro_batch_func, data=batch)
@@ -713,6 +756,7 @@ class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
             value_model=True,
             vision_model=hasattr(self.model_config.hf_config, "vision_config"),
             pad_token_id=self.model_config.tokenizer.pad_token_id,
+            mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
         )
 
         return output, partial(postprocess_micro_batch_func, data=batch)

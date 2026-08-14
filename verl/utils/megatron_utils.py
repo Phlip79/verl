@@ -32,6 +32,7 @@ from megatron.core.enums import ModelType
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_attr_wrapped_model
 from transformers import PretrainedConfig
 
@@ -40,6 +41,7 @@ from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fs import local_mkdir_safe
 from verl.utils.model import normalize_model_name
 from verl.utils.torch_dtypes import PrecisionType
+from verl.workers.config import HFModelConfig, McoreEngineConfig
 
 
 def get_model_config(model):
@@ -60,7 +62,7 @@ def get_model(
         mpu.get_pipeline_model_parallel_world_size() > 1
         and mpu.get_virtual_pipeline_model_parallel_world_size() is not None
     ):
-        assert model_type != ModelType.encoder_and_decoder, (
+        assert model_type != getattr(ModelType, "encoder_and_decoder", None), (
             "Interleaved schedule not supported for model with both encoder and decoder"
         )
         model = []
@@ -80,8 +82,10 @@ def get_model(
         post_process = mpu.is_pipeline_last_stage()
         add_encoder = True
         add_decoder = True
-        assert model_type != ModelType.encoder_and_decoder, "Model type encoder_and_decoder is not supported"
-        if model_type == ModelType.encoder_and_decoder:
+        assert model_type != getattr(ModelType, "encoder_and_decoder", None), (
+            "Model type encoder_and_decoder is not supported"
+        )
+        if model_type == getattr(ModelType, "encoder_and_decoder", None):
             if mpu.get_pipeline_model_parallel_world_size() > 1:
                 assert mpu.get_pipeline_model_parallel_split_rank() is not None, (
                     "Split rank needs to be specified for model with both encoder and decoder"
@@ -203,6 +207,9 @@ def make_megatron_module(
         if override_model_config.get("moe_config", {}).get("freeze_moe_router", False):
             post_model_creation_callbacks.append(freeze_moe_router)
         if provider is not None:
+            from megatron.bridge.peft.utils import create_peft_hook, load_peft_adapter_checkpoint
+            from megatron.bridge.training.utils.config_utils import create_ddp_config
+
             # When using PEFT with Megatron-Bridge, we must apply PEFT transformation
             # BEFORE wrapping the model in DDP. This is required because:
             # 1. PEFT freezes base model parameters (requires_grad=False)
@@ -213,56 +220,58 @@ def make_megatron_module(
             # Register PEFT transformation as pre-wrap hook if peft_cls is specified
             # This must happen BEFORE DDP wrapping to avoid KeyError with frozen parameters
             if peft_cls is not None:
-                from verl.utils.megatron_peft_utils import load_adapter_checkpoint, print_adapter_info
+                from verl.utils.megatron_peft_utils import print_adapter_info
 
-                def peft_pre_wrap_hook(model):
-                    """Pre-wrap hook that applies PEFT transformation."""
-                    # Apply PEFT transformation - this will freeze base model and add adapters
-                    # The PEFT callable handles both freezing and transformation
-                    transformed_model = peft_cls(model, training=True)
+                provider.register_pre_wrap_hook(create_peft_hook(peft_cls, training=True))
 
-                    # Set parameters to save (adapter-only checkpointing)
-                    peft_cls.set_params_to_save(transformed_model)
+                adapter_path = peft_config.get("adapter_path", None)
+                if adapter_path:
 
-                    # Load adapter weights if adapter_path is specified
-                    adapter_path = getattr(peft_config, "adapter_path", None)
-                    if adapter_path is not None and adapter_path:
+                    def adapter_checkpoint_hook(model):
                         print(f"Loading adapter weights from: {adapter_path}")
-                        load_adapter_checkpoint(transformed_model, adapter_path)
+                        load_peft_adapter_checkpoint(
+                            model,
+                            adapter_path,
+                            peft=peft_cls,
+                            strict=False,
+                        )
+                        return model
 
-                    # Print PEFT statistics
+                    provider.register_pre_wrap_hook(adapter_checkpoint_hook)
+
+                def peft_info_hook(model):
                     if torch.distributed.get_rank() == 0:
-                        print_adapter_info(transformed_model)
+                        print_adapter_info(model)
+                    return model
 
-                    return transformed_model
-
-                provider.register_pre_wrap_hook(peft_pre_wrap_hook)
+                provider.register_pre_wrap_hook(peft_info_hook)
 
             # Register post-creation callbacks (make_value_model, freeze_moe_router) as pre-wrap hooks
             for callback in post_model_creation_callbacks:
                 provider.register_pre_wrap_hook(callback)
 
             # Create DDP config if needed
-            ddp_config = None
-            if wrap_config.wrap_with_ddp:
-                from megatron.bridge.training.config import DistributedDataParallelConfig
-
-                ddp_config_dict = {
-                    "use_distributed_optimizer": wrap_config.use_distributed_optimizer,
-                }
-                # Apply any DDP config overrides
-                if override_ddp_config is not None:
-                    ddp_config_dict.update(override_ddp_config)
-
-                ddp_config = DistributedDataParallelConfig(**ddp_config_dict)
-                ddp_config.finalize()
-
-            # Now call provide_distributed_model with all hooks registered
-            # Hooks will be applied automatically before DDP wrapping
-            model = provider.provide_distributed_model(
+            ddp_config = create_ddp_config(
                 wrap_with_ddp=wrap_config.wrap_with_ddp,
-                ddp_config=ddp_config,
+                use_distributed_optimizer=wrap_config.use_distributed_optimizer,
+                use_megatron_fsdp=False,
+                overrides=override_ddp_config,
             )
+
+            provide_model_kwargs = {
+                "wrap_with_ddp": wrap_config.wrap_with_ddp,
+                "ddp_config": ddp_config,
+            }
+            provide_model_params = inspect.signature(provider.provide_distributed_model).parameters
+            if "fp16" in provide_model_params:
+                provide_model_kwargs["fp16"] = provider.fp16
+            if "bf16" in provide_model_params:
+                provide_model_kwargs["bf16"] = provider.bf16
+            if "use_megatron_fsdp" in provide_model_params:
+                provide_model_kwargs["use_megatron_fsdp"] = False
+
+            # Hooks are applied before DDP wrapping.
+            model = provider.provide_distributed_model(**provide_model_kwargs)
 
             # Extract TransformerConfig from the created model
             tf_config = get_model_config(model[0] if isinstance(model, list) else model)
@@ -1228,3 +1237,60 @@ def mapping_string_to_attn_backend(args: dict) -> dict:
 
         args["attention_backend"] = AttnBackend[args["attention_backend"]]
     return args
+
+
+def get_megatron_mtp_loss(n_micro_batch):
+    # Newer MCore tracks raw loss sums and token counts across all microbatches;
+    # older versions accumulate one normalized loss per microbatch.
+    tracker = MTPLossLoggingHelper.tracker
+    uses_global_token_mean = "loss_sums" in tracker and tracker.get("calculate_per_token_loss", True)
+    mtp_loss_scale = 1.0 if uses_global_token_mean else 1.0 / n_micro_batch
+
+    # Create a dummy total_loss_dict to collect MTP metrics
+    total_loss_dict = {}
+
+    # Track MTP metrics - this will populate total_loss_dict with MTP losses
+    MTPLossLoggingHelper.track_mtp_metrics(
+        loss_scale=mtp_loss_scale, iteration=0, writer=None, wandb_writer=None, total_loss_dict=total_loss_dict
+    )
+    # Add MTP metrics to losses_reduced if any were collected
+    # total_loss_dict: {'mtp_1 loss': tensor(value, device='cuda:0')}
+    output = {}
+    if total_loss_dict:
+        for key, value in total_loss_dict.items():
+            # Convert key to have proper prefix and format
+            formatted_key = f"mtp_losses/{key.replace(' ', '_')}"
+            # only added to the 0th batch, the MTP loss obtained is a global value, and will be the same for every batch
+            output[formatted_key] = value.cpu().item()
+    return output
+
+
+def check_mtp_config(model_config: HFModelConfig, engine_config: McoreEngineConfig):
+    """
+    Check and configure MTP (Multi-Token Prediction) settings.
+
+    Cases:
+        - mtp.enable == False and no MTP layers: return directly
+        - mtp.enable == False and has MTP layers: set num_nextn_predict_layers = 0
+        - mtp.enable == True and has MTP layers: configure override_transformer_config
+        - mtp.enable == True and no MTP layers: raise ValueError
+    """
+    has_mtp = (
+        model_config.hf_config.num_nextn_predict_layers > 0
+        if hasattr(model_config.hf_config, "num_nextn_predict_layers")
+        else False
+    )
+    enable_mtp = model_config.mtp.enable
+
+    if not enable_mtp and not has_mtp:
+        return
+    elif not enable_mtp and has_mtp:
+        model_config.hf_config.num_nextn_predict_layers = 0
+    elif enable_mtp and not has_mtp:
+        raise ValueError("enable mtp while model has no mtp layer, please use a model with mtp layer")
+    elif enable_mtp and has_mtp:
+        if "mtp_loss_scaling_factor" not in engine_config.override_transformer_config:
+            engine_config.override_transformer_config["mtp_loss_scaling_factor"] = (
+                model_config.mtp.mtp_loss_scaling_factor
+            )
+    return
