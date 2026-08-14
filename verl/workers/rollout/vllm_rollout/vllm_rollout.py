@@ -42,6 +42,7 @@ import zmq.asyncio
 from filelock import FileLock
 from torch.distributed.device_mesh import DeviceMesh
 from vllm.config import LoRAConfig
+from vllm.v1.serial_utils import run_method
 
 from verl.utils.ray_utils import get_event_loop
 
@@ -59,7 +60,6 @@ from verl.utils.device import is_npu_available
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.ray_utils import ray_noset_visible_devices
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
-from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
@@ -68,6 +68,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_NAME,
     VLLM_LORA_PATH,
     get_vllm_max_lora_rank,
+    load_mtp_aware_weights,
 )
 
 logger = logging.getLogger(__file__)
@@ -128,7 +129,12 @@ class vLLMAsyncRollout(BaseRollout):
             else {}
         )
 
-        if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
+        mtp_rollout_enabled = config.mtp is not None and config.mtp.enable and config.mtp.enable_rollout
+        if mtp_rollout_enabled:
+            # Keep vLLM's drafter allocations resident across hybrid sleep;
+            # actor synchronization restores the target and MTP parameters.
+            self.sleep_level = 1
+        elif config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
             logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
             self.sleep_level = 1
         else:
@@ -190,6 +196,14 @@ class vLLMAsyncRollout(BaseRollout):
         if self.lora_config:
             lora_dtype = getattr(torch, self.config.dtype)
             self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
+        mtp_rollout_enabled = self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout
+        if mtp_rollout_enabled and (
+            self.config.quantization is not None or getattr(self.vllm_config, "quant_config", None) is not None
+        ):
+            raise NotImplementedError(
+                "Quantized actor-to-vLLM MTP drafter synchronization is not supported; "
+                "use the BF16 Lightning checkpoint and rollout."
+            )
         if self.config.quantization is not None:
             _SUPPORTED_QUANTIZATION = ["fp8", "torchao"]
             if self.config.quantization not in _SUPPORTED_QUANTIZATION:
@@ -198,16 +212,47 @@ class vLLMAsyncRollout(BaseRollout):
                 )
 
             if self.config.quantization == "fp8":
+                from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
+
                 # Apply vllm fp8 patches
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
                 apply_vllm_fp8_patches()
 
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        # vLLM removed the vllm_config constructor argument after 0.12. The
+        # final config is supplied to init_worker below.
+        self.inference_engine = WorkerWrapperBase()
         self.inference_engine.init_worker(all_kwargs)
+
+    def _get_model_runner(self):
+        return self.inference_engine.worker.model_runner
+
+    def _get_target_model(self):
+        model_runner = self._get_model_runner()
+        get_model = getattr(model_runner, "get_model", None)
+        return get_model() if get_model is not None else model_runner.model
+
+    def _get_drafter_model(self):
+        """Return vLLM's unwrapped MTP drafter, if speculative rollout is active."""
+        model_runner = self._get_model_runner()
+        speculative_config = getattr(model_runner.vllm_config, "speculative_config", None)
+        if speculative_config is None or speculative_config.method != "mtp":
+            return None
+
+        get_draft_model = getattr(model_runner, "get_draft_model", None)
+        if get_draft_model is not None:
+            return get_draft_model()
+        drafter = getattr(model_runner, "drafter", None)
+        return getattr(drafter, "model", None)
+
+    def _iter_rollout_models(self):
+        yield self._get_target_model()
+        if (drafter_model := self._get_drafter_model()) is not None:
+            yield drafter_model
 
     def _load_model(self, *args, **kwargs):
         self.inference_engine.load_model(*args, **kwargs)
-        _monkey_patch_compute_logits(self.inference_engine.worker.model_runner.model, len(self.tokenizer))
+        for model in self._iter_rollout_models():
+            _monkey_patch_compute_logits(model, len(self.tokenizer))
 
     async def _execute_method(self, method: str | bytes, *args, **kwargs):
         if method == "init_worker":
@@ -215,7 +260,9 @@ class vLLMAsyncRollout(BaseRollout):
         elif method == "load_model":
             return self._load_model(*args, **kwargs)
         else:
-            return self.inference_engine.execute_method(method, *args, **kwargs)
+            # WorkerWrapperBase no longer exposes execute_method in vLLM
+            # 0.27. Use vLLM's own callable/bytes-aware dispatcher.
+            return run_method(self.inference_engine, method, args, kwargs)
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.
@@ -254,20 +301,37 @@ class vLLMAsyncRollout(BaseRollout):
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
-            model_runner = self.inference_engine.worker.model_runner
-            model = model_runner.model
-            patch_vllm_moe_model_weight_loader(model)
+            model_runner = self._get_model_runner()
+            model = self._get_target_model()
+            drafter_model = self._get_drafter_model()
+            for rollout_model in self._iter_rollout_models():
+                patch_vllm_moe_model_weight_loader(rollout_model)
 
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
-            if is_fp8_model(model_runner.vllm_config):
+            if drafter_model is not None and (
+                self.config.quantization is not None
+                or getattr(model_runner.vllm_config, "quant_config", None) is not None
+            ):
+                raise NotImplementedError(
+                    "Quantized actor-to-vLLM MTP drafter synchronization is not supported; "
+                    "use a BF16 rollout when model.mtp.enable_rollout=True."
+                )
+            if self.config.quantization == "fp8":
+                from verl.utils.vllm.vllm_fp8_utils import is_fp8_model, load_quanted_weights
+
+                if not is_fp8_model(model_runner.vllm_config):
+                    raise RuntimeError("rollout.quantization=fp8 did not produce a vLLM FP8 quantization config")
                 logger.info(f"FP8 model detected (async): {model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
                 loaded_params = load_quanted_weights(weights, model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
-                model.load_weights(weights)
+                # The Nemotron-H target loader ignores ``mtp.*`` while the
+                # drafter loader consumes that namespace. The helper retains
+                # only the small MTP block while streaming the full model once.
+                load_mtp_aware_weights(model, drafter_model, weights)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode.

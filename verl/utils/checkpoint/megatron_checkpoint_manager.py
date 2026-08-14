@@ -16,8 +16,8 @@ import json
 import logging
 import os
 import random
-from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import fields, is_dataclass
+from enum import Enum
 
 import numpy as np
 import ray
@@ -25,7 +25,6 @@ import torch
 import torch.distributed
 from megatron.core import mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
-from megatron.core.transformer.enums import AttnBackend
 from ray.util.state import api
 from transformers import GenerationConfig
 
@@ -45,6 +44,61 @@ from .checkpoint_manager import BaseCheckpointManager
 # Setup logging
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+_SKIP_CONFIG_VALUE = object()
+
+
+def _to_json_safe_config_value(value, seen):
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if type(value) is torch.dtype or isinstance(value, Enum):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if callable(value):
+        return _SKIP_CONFIG_VALUE
+    if isinstance(value, list | tuple):
+        value_id = id(value)
+        if value_id in seen:
+            return _SKIP_CONFIG_VALUE
+        seen.add(value_id)
+        converted = []
+        for item in value:
+            converted_item = _to_json_safe_config_value(item, seen)
+            if converted_item is not _SKIP_CONFIG_VALUE:
+                converted.append(converted_item)
+        seen.remove(value_id)
+        return converted
+    if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in seen:
+            return _SKIP_CONFIG_VALUE
+        seen.add(value_id)
+        converted = {}
+        for key, item in value.items():
+            converted_key = _to_json_safe_config_value(key, seen)
+            converted_item = _to_json_safe_config_value(item, seen)
+            if converted_key is not _SKIP_CONFIG_VALUE and converted_item is not _SKIP_CONFIG_VALUE:
+                converted[str(converted_key)] = converted_item
+        seen.remove(value_id)
+        return converted
+    return _SKIP_CONFIG_VALUE
+
+
+def _to_json_safe_config_dict(config_dict):
+    json_safe_config = {}
+    for key, value in config_dict.items():
+        converted = _to_json_safe_config_value(value, set())
+        if converted is not _SKIP_CONFIG_VALUE:
+            json_safe_config[key] = converted
+    return json_safe_config
+
+
+def _config_to_shallow_dict(config):
+    if is_dataclass(config):
+        return {field.name: getattr(config, field.name) for field in fields(config) if hasattr(config, field.name)}
+    return vars(config)
 
 
 class MegatronCheckpointManager(BaseCheckpointManager):
@@ -261,7 +315,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 key = "model"
             if hasattr(model, "module"):
                 model = model.module
-            state_dict[key] = model.sharded_state_dict()
+
+            # MCore's MTP sharded state dict requires metadata['dp_cp_group'].
+            kwargs = {"metadata": {"dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)}}
+            state_dict[key] = model.sharded_state_dict(**kwargs)
 
         # Optimizer State Dict
         if generate_optimizer:
@@ -477,7 +534,30 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 assert async_save_request is None, "Async save request should be None when not using async save."
                 torch.distributed.barrier()
 
+        hf_config_tokenizer_path = get_hf_model_checkpoint_path(local_path)
+        if self.should_save_model and self.rank == 0:
+            # Bridge reads config.json while inferring HF shards. Write it first
+            # so MoE/MTP parameters are not omitted from a newly created checkpoint.
+            if self.processing_class is not None:
+                self.processing_class.save_pretrained(hf_config_tokenizer_path)
+            self.hf_config.save_pretrained(hf_config_tokenizer_path)
+            if hasattr(self.hf_config, "name_or_path") and self.hf_config.name_or_path:
+                try:
+                    generation_config = GenerationConfig.from_pretrained(self.hf_config.name_or_path)
+                    generation_config.save_pretrained(hf_config_tokenizer_path)
+                except Exception:
+                    # if the generation config isn't available, we don't save it
+                    pass
+            log_with_rank(
+                f"Saved Huggingface config and tokenizer to {hf_config_tokenizer_path}",
+                rank=self.rank,
+                logger=logger,
+                log_only_rank_0=True,
+            )
+
         if self.should_save_model:
+            torch.distributed.barrier()
+
             # Save adapter-only checkpoint if PEFT is enabled
             if self.peft_cls is not None:
                 from verl.utils.megatron_peft_utils import save_adapter_checkpoint
@@ -509,65 +589,19 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     self.bridge.save_hf_weights(self.model, hf_ckpt_path)
 
                 log_with_rank(f"Saved bridge checkpoint to {hf_ckpt_path}", rank=self.rank, logger=logger)
-
-            # Only rank 0 saves the hf config and tokenizer to huggingface path
-            # No matter whether we save hf model or not
-            if self.rank == 0:
-                # Save tokenizer
-                hf_config_tokenizer_path = get_hf_model_checkpoint_path(local_path)
-                if self.processing_class is not None:
-                    self.processing_class.save_pretrained(hf_config_tokenizer_path)
-                # Save huggingface config
-                self.hf_config.save_pretrained(hf_config_tokenizer_path)
-                if hasattr(self.hf_config, "name_or_path") and self.hf_config.name_or_path:
-                    try:
-                        generation_config = GenerationConfig.from_pretrained(self.hf_config.name_or_path)
-                        generation_config.save_pretrained(hf_config_tokenizer_path)
-                    except Exception:
-                        # if the generation config isn't available, we don't save it
-                        pass
-                log_with_rank(
-                    f"Saved Huggingface config and tokenizer to {hf_config_tokenizer_path}",
-                    rank=self.rank,
-                    logger=logger,
-                    log_only_rank_0=True,
-                )
-
         if self.should_save_extra:
             if self.rank == 0:
                 # Save transformer config
                 print(self.transformer_config)
-                bypass_keys = [
-                    "finalize_model_grads_func",
-                    "grad_scale_func",
-                    "no_sync_func",
-                    "grad_sync_func",
-                    "param_sync_func",
-                    "generation_config",
-                ]
-                backup = {}
-                for k in bypass_keys:
-                    if hasattr(self.transformer_config, k):
-                        backup[k] = getattr(self.transformer_config, k, None)
-                        delattr(self.transformer_config, k)
-                transformer_config_dict = asdict(self.transformer_config)
-                for k in backup:
-                    setattr(self.transformer_config, k, backup[k])
-                to_convert_types = {torch.dtype: str, AttnBackend: str}
-                ignore_types = [Callable]
-                pop_keys = []
-                for key, value in transformer_config_dict.items():
-                    if type(value) in to_convert_types:
-                        transformer_config_dict[key] = to_convert_types[type(value)](value)
-                    if type(value) in ignore_types:
-                        pop_keys.append(key)
-                    if callable(value):
-                        pop_keys.append(key)
-                for key in pop_keys:
-                    transformer_config_dict.pop(key)
+                transformer_config_dict = _to_json_safe_config_dict(_config_to_shallow_dict(self.transformer_config))
                 transformer_config_path = get_transformer_config_checkpoint_path(local_path)
                 with open(transformer_config_path, "w") as f:
-                    json.dump(transformer_config_dict, f, indent=2)
+                    json.dump(
+                        transformer_config_dict,
+                        f,
+                        indent=2,
+                        default=lambda o: o.to_dict() if hasattr(o, "to_dict") else o,
+                    )
 
         if self.should_save_hf_model and not self.use_hf_checkpoint:
             # wait for everyone to dump to local

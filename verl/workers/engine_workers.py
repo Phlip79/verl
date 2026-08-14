@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+from copy import deepcopy
 from functools import partial
 from itertools import chain
 from typing import Any, Optional
@@ -38,7 +39,7 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import allgather_dict_into_dict
-from verl.workers.config import ActorConfig, HFModelConfig, RolloutConfig, TrainingWorkerConfig
+from verl.workers.config import ActorConfig, HFModelConfig, MtpConfig, RolloutConfig, TrainingWorkerConfig
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
 from verl.workers.utils.losses import ppo_loss
 
@@ -158,6 +159,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
             final_metrics["grad_norm"] = grad_norm
         if lr is not None:
             final_metrics["lr"] = lr
+
+        # TODO: confirm the mtp loss IS same across dp
+        for k, v in final_metrics.items():
+            if k.startswith("mtp_losses"):
+                flatten_v = [sublist[0] for sublist in v]  # sublist should be single element
+                final_metrics[k] = sum(flatten_v) / len(flatten_v)
         # compute mfu
         if global_token_num is not None:
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_token_num, delta_time)
@@ -412,7 +419,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.use_dynamic_bsz = self.config.ref.pop("log_prob_use_dynamic_bsz", False)
                 self.config.ref.ppo_max_token_len_per_gpu = self.config.ref.pop("log_prob_max_token_len_per_gpu", None)
             ref_config: ActorConfig = omega_conf_to_dataclass(self.config.ref)
-            ref_config.model_config = model_config
+
+            # The ref model does not need to enable MTP; force it to false.
+            ref_config.model_config = deepcopy(model_config)
+            ref_config.model_config.mtp = MtpConfig(enable=False)
 
             # construct TrainingWorkerConfig
             ref_training_config = TrainingWorkerConfig(

@@ -47,6 +47,7 @@ from verl.utils.rollout_trace import (
     rollout_trace_attr,
     rollout_trace_op,
 )
+from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 
@@ -290,9 +291,9 @@ class AgentLoopBase(ABC):
                 return_tensors="pt",
                 do_sample_frames=False,
             )
-            prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+            prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
         else:
-            prompt_ids = await self.loop.run_in_executor(
+            tokenized_prompt = await self.loop.run_in_executor(
                 None,
                 lambda: self.tokenizer.apply_chat_template(
                     messages,
@@ -302,6 +303,7 @@ class AgentLoopBase(ABC):
                     **self.apply_chat_template_kwargs,
                 ),
             )
+            prompt_ids = normalize_token_ids(tokenized_prompt)
 
         if remove_system_prompt:
             prompt_ids = prompt_ids[len(self.system_prompt) :]

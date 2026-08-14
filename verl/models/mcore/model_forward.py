@@ -15,9 +15,11 @@
 # limitations under the License.
 
 import torch
+from torch.nested._internal.nested_tensor import NestedTensor
 
 from verl.utils.megatron_utils import unwrap_model
 
+from .mtp_support import is_native_hybrid_model
 from .util import (
     postprocess_bshd,
     postprocess_bshd_no_padding,
@@ -146,6 +148,84 @@ def model_forward_gen(vision_model: bool = False):
     return model_forward
 
 
+def _convert_to_nested_tensor(v, input_ids_lengths):
+    """Convert regular tensor to NestedTensor, slicing according to input_ids_lengths.
+
+    Args:
+        v: Tensor to convert, shape [batch, seq_len]
+        input_ids_lengths: List of valid lengths for each sample
+
+    Returns:
+        Converted NestedTensor
+    """
+    if isinstance(v, NestedTensor):
+        return v
+
+    batch_size = v.shape[0]
+    assert len(input_ids_lengths) == batch_size, (
+        f"len(input_ids_lengths)={len(input_ids_lengths)} != batch_size={batch_size}"
+    )
+
+    v_split_list = []
+    for i in range(batch_size):
+        vi = v[i]
+        target_len = input_ids_lengths[i]
+        if vi.shape[0] > target_len:
+            vi = vi[:target_len]
+        elif vi.shape[0] < target_len:
+            vi = torch.cat([vi, torch.ones(target_len - vi.shape[0], dtype=vi.dtype, device=vi.device)])
+        v_split_list.append(vi)
+
+    v = torch.nested.nested_tensor(v_split_list, layout=torch.jagged)
+    return v
+
+
+def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_attention_mask):
+    """Align a response-only MTP loss mask with packed ``[prompt; response]`` inputs."""
+    if isinstance(response_mask, NestedTensor):
+        response_offsets = response_mask.offsets().tolist()
+        response_lengths = [response_offsets[i + 1] - response_offsets[i] for i in range(len(response_offsets) - 1)]
+        batch_size = len(response_lengths)
+        response_values = response_mask.values()
+    else:
+        assert response_attention_mask is not None, "response_attention_mask is required to align padded MTP loss_mask"
+        assert not isinstance(response_attention_mask, NestedTensor), (
+            "response_attention_mask must be a padded (bs, max_response_len) tensor, got NestedTensor"
+        )
+        assert response_attention_mask.shape == response_mask.shape, (
+            f"response_attention_mask shape {response_attention_mask.shape} "
+            f"!= response_mask shape {response_mask.shape}"
+        )
+        batch_size = response_mask.shape[0]
+        response_lengths = response_attention_mask.to(torch.int32).sum(dim=-1).tolist()
+
+    assert len(input_ids_lengths) == batch_size, (
+        f"len(input_ids_lengths)={len(input_ids_lengths)} != batch_size={batch_size}"
+    )
+
+    pieces = []
+    for i in range(batch_size):
+        actual_total = int(input_ids_lengths[i])
+        actual_response = int(response_lengths[i])
+        actual_prompt = actual_total - actual_response
+        assert actual_prompt >= 0, (
+            f"sample {i}: actual_response={actual_response} > actual_total={actual_total}; "
+            "loss_mask cannot be longer than input_ids"
+        )
+        prompt_pad = torch.zeros(actual_prompt, dtype=response_mask.dtype, device=response_mask.device)
+        if isinstance(response_mask, NestedTensor):
+            response_piece = response_values[response_offsets[i] : response_offsets[i + 1]]
+        else:
+            response_piece = response_mask[i, :actual_response]
+        full = torch.cat([prompt_pad, response_piece], dim=0)
+        assert full.shape[0] == actual_total, (
+            f"sample {i}: built loss_mask length {full.shape[0]} != input_ids length {actual_total}"
+        )
+        pieces.append(full)
+
+    return torch.nested.nested_tensor(pieces, layout=torch.jagged)
+
+
 def gptmodel_forward_no_padding(
     model,
     input_ids,
@@ -156,12 +236,15 @@ def gptmodel_forward_no_padding(
     vision_model=False,
     pad_token_id=None,
     data_format: str = "thd",
+    mtp_enable_train: bool = False,
 ):
     """Default forward pass for GPT models with optional sequence packing."""
 
     assert data_format in ["thd", "bshd"], "data_format must be 'thd' or 'bshd'"
     pre_process = unwrap_model(model).pre_process
     post_process = unwrap_model(model).post_process
+    native_hybrid_model = is_native_hybrid_model(unwrap_model(model))
+    native_hybrid_mtp = mtp_enable_train and native_hybrid_model
 
     model_kwargs = {}
     if "pixel_values" in multi_modal_inputs:
@@ -175,8 +258,45 @@ def gptmodel_forward_no_padding(
 
     batch_size = input_ids.shape[0]
     if data_format == "thd":
-        input_ids_rmpad, packed_seq_params = preprocess_thd_no_padding(input_ids, pre_process=pre_process)
+        input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_no_padding(
+            input_ids,
+            pre_process=pre_process or (post_process and mtp_enable_train),
+            include_total_tokens=native_hybrid_model,
+        )
         input_ids_rmpad = input_ids_rmpad.contiguous()
+
+        args = {}
+        if mtp_enable_train and post_process:
+            # Use input_ids sequence length to ensure label and loss_mask alignment
+            input_ids_offsets = input_ids.offsets()
+            input_ids_lengths = input_ids_offsets.diff().tolist()
+            response_attention_mask = logits_processor_args.get("response_attention_mask", None)
+            label = _convert_to_nested_tensor(logits_processor_args["label"], input_ids_lengths)
+            loss_mask = _build_mtp_loss_mask_nested(
+                logits_processor_args["loss_mask"], input_ids_lengths, response_attention_mask
+            )
+            logits_processor_args["label"] = label
+            logits_processor_args["loss_mask"] = loss_mask
+
+            if native_hybrid_mtp:
+                # Native MCore derives MTP targets from input_ids. Keeping
+                # labels unset preserves the normal logits path for PPO/SFT.
+                model_kwargs["labels"] = None
+                model_kwargs["loss_mask"] = preprocess_thd_no_padding(
+                    loss_mask,
+                    pre_process=True,
+                    need_roll=False,
+                )[0].contiguous()
+            else:
+                for k, v in (("label", label), ("loss_mask", loss_mask)):
+                    args[k] = preprocess_thd_no_padding(v, pre_process=True, need_roll=True)[0]
+                model_kwargs["labels"] = args["label"].contiguous()
+                model_kwargs["loss_mask"] = args["loss_mask"].contiguous()
+
+        if logits_processor_args and "loss_mask" in logits_processor_args:
+            logits_processor_args.pop("loss_mask")
+        if logits_processor_args and "response_attention_mask" in logits_processor_args:
+            logits_processor_args.pop("response_attention_mask")
 
         # For VLM model, need to pass bshd format `input_ids` and `attention_mask`.
         attention_mask = None
@@ -190,7 +310,7 @@ def gptmodel_forward_no_padding(
         output_orig = model(
             input_ids=input_ids_rmpad,
             attention_mask=attention_mask,
-            position_ids=None,
+            position_ids=position_ids_rmpad if not vision_model else None,  # vision models will calculate position_ids
             packed_seq_params=packed_seq_params,
             **model_kwargs,
         )
@@ -219,8 +339,39 @@ def gptmodel_forward_no_padding(
         """
 
         input_ids_bshd, attention_mask_bshd, position_ids_bshd = preprocess_bshd_no_padding(
-            input_ids, pre_process=pre_process
+            input_ids, pre_process=pre_process or (post_process and mtp_enable_train)
         )
+
+        if mtp_enable_train and post_process:
+            args = {}
+            # Use input_ids sequence length to ensure label and loss_mask alignment
+            input_ids_offsets = input_ids.offsets()
+            input_ids_lengths = input_ids_offsets.diff().tolist()
+            response_attention_mask = logits_processor_args.get("response_attention_mask", None)
+            label = _convert_to_nested_tensor(logits_processor_args["label"], input_ids_lengths)
+            loss_mask = _build_mtp_loss_mask_nested(
+                logits_processor_args["loss_mask"], input_ids_lengths, response_attention_mask
+            )
+            logits_processor_args["label"] = label
+            logits_processor_args["loss_mask"] = loss_mask
+
+            if native_hybrid_mtp:
+                model_kwargs["labels"] = None
+                model_kwargs["loss_mask"] = preprocess_bshd_no_padding(loss_mask, pre_process=True, need_roll=False)[
+                    0
+                ].contiguous()
+            else:
+                args = {}
+                for k, v in (("label", label), ("loss_mask", loss_mask)):
+                    args[k] = preprocess_bshd_no_padding(v, pre_process=True, need_roll=True)[0]
+                model_kwargs["labels"] = args["label"].contiguous()
+                model_kwargs["loss_mask"] = args["loss_mask"].contiguous()
+
+        if logits_processor_args and "loss_mask" in logits_processor_args:
+            logits_processor_args.pop("loss_mask")
+        if logits_processor_args and "response_attention_mask" in logits_processor_args:
+            logits_processor_args.pop("response_attention_mask")
+
         output_orig = model(
             input_ids=input_ids_bshd,
             attention_mask=attention_mask_bshd,
