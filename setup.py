@@ -29,7 +29,10 @@ install_requires = [
     "datasets",
     "dill",
     "hydra-core",
-    "numpy<2.0.0",
+    # The pinned Nemotron image is Python 3.12 and vLLM's OpenCV runtime
+    # requires NumPy 2 there. Preserve v0.7's original constraint elsewhere.
+    "numpy<2.0.0; python_version < '3.12'",
+    "numpy>=2.0.0; python_version >= '3.12'",
     "pandas",
     "peft",
     "pyarrow>=19.0.0",
@@ -49,7 +52,11 @@ PRIME_REQUIRES = ["pyext"]
 GEO_REQUIRES = ["mathruler", "torchvision", "qwen_vl_utils"]
 GPU_REQUIRES = ["liger-kernel", "flash-attn"]
 MATH_REQUIRES = ["math-verify"]  # Add math-verify as an optional dependency
-VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.10.0,!=0.9.0", "vllm>=0.8.5,<=0.12.0"]
+VLLM_REQUIRES = [
+    "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
+    "vllm>=0.8.5,<=0.12.0; python_version < '3.12'",
+    "vllm>=0.18.0; python_version >= '3.12'",
+]
 SGLANG_REQUIRES = [
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
     "sglang[srt,openai]==0.5.6",

@@ -67,7 +67,13 @@ from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
     VLLM_LORA_PATH,
+    create_vllm_worker_wrapper,
+    execute_vllm_worker_method,
     get_vllm_max_lora_rank,
+    get_vllm_models_for_weight_sync,
+    is_mtp_rollout_enabled,
+    load_weights_into_vllm_models,
+    process_vllm_models_after_weight_sync,
 )
 
 logger = logging.getLogger(__file__)
@@ -128,7 +134,12 @@ class vLLMAsyncRollout(BaseRollout):
             else {}
         )
 
-        if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
+        mtp_rollout_enabled = is_mtp_rollout_enabled(config, model_config)
+        if mtp_rollout_enabled:
+            # vLLM sleep level 2 can discard state owned only by the MTP drafter.
+            # Keeping weights resident is required for correct speculation after wake-up.
+            self.sleep_level = 1
+        elif config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
             logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
             self.sleep_level = 1
         else:
@@ -175,6 +186,10 @@ class vLLMAsyncRollout(BaseRollout):
                 await self.socket.send(pickle.dumps(e))
                 break
 
+    def _build_inference_engine(self) -> WorkerWrapperBase:
+        """Create a wrapper across the old and vLLM 0.27 constructor APIs."""
+        return create_vllm_worker_wrapper(WorkerWrapperBase, self.vllm_config)
+
     def _init_worker(self, all_kwargs: list[dict[str, Any]]):
         """Initialize worker engine."""
         if not torch.distributed.is_initialized():
@@ -202,12 +217,14 @@ class vLLMAsyncRollout(BaseRollout):
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
                 apply_vllm_fp8_patches()
 
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        self.inference_engine = self._build_inference_engine()
         self.inference_engine.init_worker(all_kwargs)
 
     def _load_model(self, *args, **kwargs):
         self.inference_engine.load_model(*args, **kwargs)
-        _monkey_patch_compute_logits(self.inference_engine.worker.model_runner.model, len(self.tokenizer))
+        model_runner = self.inference_engine.worker.model_runner
+        for model in get_vllm_models_for_weight_sync(model_runner):
+            _monkey_patch_compute_logits(model, len(self.tokenizer))
 
     async def _execute_method(self, method: str | bytes, *args, **kwargs):
         if method == "init_worker":
@@ -215,7 +232,11 @@ class vLLMAsyncRollout(BaseRollout):
         elif method == "load_model":
             return self._load_model(*args, **kwargs)
         else:
-            return self.inference_engine.execute_method(method, *args, **kwargs)
+            # Plain WorkerWrapperBase no longer exposes execute_method in
+            # vLLM 0.27.  This is the dispatch primitive used by vLLM's own
+            # executor wrappers and supports names, serialized callables, and
+            # callable objects.
+            return execute_vllm_worker_method(self.inference_engine, method, args, kwargs)
 
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.
@@ -255,19 +276,30 @@ class vLLMAsyncRollout(BaseRollout):
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
             model_runner = self.inference_engine.worker.model_runner
-            model = model_runner.model
-            patch_vllm_moe_model_weight_loader(model)
+            models = get_vllm_models_for_weight_sync(model_runner)
+            for model in models:
+                patch_vllm_moe_model_weight_loader(model)
 
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
             if is_fp8_model(model_runner.vllm_config):
+                if len(models) > 1:
+                    raise NotImplementedError("MTP drafter weight synchronization currently requires BF16 rollout")
                 logger.info(f"FP8 model detected (async): {model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
                 loaded_params = load_quanted_weights(weights, model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
-                model.load_weights(weights)
+                # The actor export is a one-shot generator. Replay bounded
+                # lists to the target and MTP draft loaders without
+                # materializing the full 30B checkpoint in host memory.
+                load_weights_into_vllm_models(models, weights, self.config.update_weights_bucket_megabytes)
+
+                # vLLM's normal loader invokes this once after load_weights.
+                # Dynamic updates must preserve the same ordering; several
+                # transforms are non-idempotent and cannot run per bucket.
+                process_vllm_models_after_weight_sync(model_runner)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode.

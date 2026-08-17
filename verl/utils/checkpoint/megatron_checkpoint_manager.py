@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import json
 import logging
 import os
@@ -261,7 +262,12 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 key = "model"
             if hasattr(model, "module"):
                 model = model.module
-            state_dict[key] = model.sharded_state_dict()
+            sharded_state_dict_kwargs = {}
+            if "metadata" in inspect.signature(model.sharded_state_dict).parameters:
+                sharded_state_dict_kwargs["metadata"] = {
+                    "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)
+                }
+            state_dict[key] = model.sharded_state_dict(**sharded_state_dict_kwargs)
 
         # Optimizer State Dict
         if generate_optimizer:

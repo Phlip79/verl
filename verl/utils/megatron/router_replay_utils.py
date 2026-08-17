@@ -31,10 +31,11 @@ except ImportError:
 from megatron.core import parallel_state as mpu
 from megatron.core.pipeline_parallel.schedules import get_schedule_table
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
-from verl.models.mcore.util import postprocess_packed_seqs, preprocess_packed_seqs
+from verl.models.mcore.util import postprocess_packed_seqs, preprocess_packed_seqs, preprocess_thd_no_padding
 from verl.utils.device import get_device_name
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
 
@@ -210,7 +211,71 @@ def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_lis
         mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
 
 
-def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
+def is_moe_layer(tf_config, layer_idx):
+    """Return whether a zero-based global decoder layer contains an MoE router."""
+    moe_layer_freq = getattr(tf_config, "moe_layer_freq", None)
+    if moe_layer_freq is None:
+        return getattr(tf_config, "num_moe_experts", None) is not None
+    if isinstance(moe_layer_freq, int):
+        return layer_idx % moe_layer_freq == 0
+    if isinstance(moe_layer_freq, list):
+        return moe_layer_freq[layer_idx] == 1
+    raise ValueError(f"Unsupported moe_layer_freq type: {type(moe_layer_freq)}")
+
+
+def build_r3_replay_mask(input_ids: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """Replay every causal row affecting response log-probs except the unused final row."""
+    if not input_ids.is_nested:
+        raise TypeError("R3 router replay requires jagged input_ids")
+
+    total_lens = input_ids.offsets().diff()
+    response_lens = response_mask.sum(dim=-1).to(device=total_lens.device, dtype=total_lens.dtype)
+    batch_size = total_lens.size(0)
+    values = torch.tensor([True, False], dtype=torch.bool, device=total_lens.device).repeat(batch_size)
+    replay_lens = torch.where(response_lens > 0, total_lens - 1, torch.zeros_like(total_lens))
+    suffix_lens = total_lens - replay_lens
+    counts = torch.stack([replay_lens, suffix_lens], dim=1).flatten()
+    mask_values = torch.repeat_interleave(values, counts)
+    return torch.nested.nested_tensor_from_jagged(mask_values, offsets=input_ids.offsets())
+
+
+def align_r3_router_replay_data(layers_topk_idx: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    """Accept full rollout routes or append the one autoregressively unavailable final row."""
+    if not layers_topk_idx.is_nested or not input_ids.is_nested:
+        raise TypeError("R3 router replay requires jagged route targets and input_ids")
+
+    route_parts = list(layers_topk_idx.unbind())
+    input_lens = [int(length) for length in input_ids.offsets().diff().tolist()]
+    if len(route_parts) != len(input_lens):
+        raise RuntimeError(
+            f"R3 router replay has {len(route_parts)} route sequences for {len(input_lens)} input sequences"
+        )
+
+    aligned_parts = []
+    for sample_id, (routes, input_len) in enumerate(zip(route_parts, input_lens, strict=True)):
+        route_len = routes.shape[0]
+        if route_len == input_len:
+            aligned_parts.append(routes)
+        elif route_len == input_len - 1:
+            placeholder = torch.zeros((1, *routes.shape[1:]), dtype=routes.dtype, device=routes.device)
+            aligned_parts.append(torch.cat((routes, placeholder), dim=0))
+        else:
+            raise RuntimeError(
+                f"R3 router replay sample {sample_id} has {route_len} route rows for {input_len} input tokens; "
+                "expected equal lengths or exactly one missing final route"
+            )
+
+    return torch.nested.as_nested_tensor(aligned_parts, layout=torch.jagged)
+
+
+def set_router_replay_data(
+    layers_topk_idx,
+    attention_mask,
+    tf_config,
+    vp_rank=None,
+    replay_mask=None,
+    model=None,
+):
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
     RouterReplay instance with target indices for replay mode.
@@ -225,28 +290,99 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
         tf_config: Megatron/Transformer engine configuration object.
         vp_rank (Optional[int]): Virtual pipeline stage rank override. If None, the current VP rank from
             Megatron parallel state will be used.
+        replay_mask (Optional[torch.Tensor]): Per-token mask. True rows replay rollout routes;
+            false rows retain Megatron's native route.
+        model: Forwarded model (or VPP chunks). When supplied, address its live decoder routers
+            directly and exclude discarded/orphan and sibling MTP routers.
 
     Returns:
         None: The function updates internal RouterReplay instances in-place.
     """
     with torch.no_grad():
-        layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
+        replay_mask_rmpad = None
+        if layers_topk_idx.is_nested:
+            layers_topk_idx_rmpad, _ = preprocess_thd_no_padding(layers_topk_idx, pre_process=True, need_roll=False)
+            if replay_mask is not None:
+                replay_mask_rmpad, _ = preprocess_thd_no_padding(replay_mask, pre_process=True, need_roll=False)
+        else:
+            layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
         layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
 
         # 1, dynamic_bs_split, layer_num, topk
         layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
             layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
         ).unsqueeze(dim=0)
+        replay_mask_rmpad_split = None
+        if replay_mask_rmpad is not None:
+            replay_mask_rmpad_split = scatter_to_sequence_parallel_region(
+                replay_mask_rmpad.to(device_name).squeeze(dim=0)
+            )
 
         # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
         layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
             dim=0
         )  # layer_num, dynamic_bs_all, topk
+        route_layer_count = len(layers_topk_idx_reshape)
+        moe_layer_count = sum(is_moe_layer(tf_config, layer_idx) for layer_idx in range(tf_config.num_layers))
+        if route_layer_count == tf_config.num_layers:
+            index_by_layer = True
+        elif route_layer_count == moe_layer_count:
+            index_by_layer = False
+        else:
+            raise RuntimeError(
+                "Router replay route-layer dimension must contain either every decoder layer "
+                f"({tf_config.num_layers}) or every MoE layer ({moe_layer_count}); got {route_layer_count}"
+            )
+
+        if model is not None:
+            model_routers = list(iter_model_routers(model))
+            unmatched_layers = []
+            for layer_number, router in model_routers:
+                layer_idx = layer_number - 1
+                idx = layer_idx if index_by_layer else sum(1 for i in range(layer_idx) if is_moe_layer(tf_config, i))
+                if 0 <= idx < layers_topk_idx_reshape.shape[0]:
+                    router.set_target_indices(
+                        layers_topk_idx_reshape[idx].to(torch.int64), replay_mask=replay_mask_rmpad_split
+                    )
+                else:
+                    unmatched_layers.append(layer_number)
+            if not model_routers:
+                raise RuntimeError("R3 router replay found no live decoder routers in the forwarded Megatron model")
+            if unmatched_layers:
+                raise RuntimeError(
+                    "R3 router replay has no route row for live decoder layer(s) "
+                    f"{unmatched_layers}; received {layers_topk_idx_reshape.shape[0]} route rows"
+                )
+            return
+
         local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
-        offset, _ = local_rank_info["start"], local_rank_info["end"]
+        offset, end = local_rank_info["start"], local_rank_info["end"]
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
-        for i, router in enumerate(router_instances_list):
-            router.set_target_indices(layers_topk_idx_reshape[i + offset].to(torch.int64))
+        moe_idx = sum(1 for i in range(offset) if is_moe_layer(tf_config, i))
+        router_offset = 0
+        for layer_idx in range(offset, end):
+            if not is_moe_layer(tf_config, layer_idx):
+                continue
+            router = router_instances_list[router_offset]
+            idx = layer_idx if index_by_layer else moe_idx
+            router.set_target_indices(layers_topk_idx_reshape[idx].to(torch.int64), replay_mask=replay_mask_rmpad_split)
+            router_offset += 1
+            moe_idx += 1
+
+
+def iter_model_routers(model):
+    """Yield live decoder routers, excluding discarded builds and sibling MTP heads."""
+    for chunk in model if isinstance(model, (list, tuple)) else [model]:
+        for module in getattr(chunk, "decoder", chunk).modules():
+            router = getattr(module, "router_replay", None)
+            if isinstance(module, TopKRouter) and router is not None and module.layer_number is not None:
+                yield module.layer_number, router
+
+
+def set_model_router_replay_action(model, router_replay_action):
+    """Set replay state on the routers belonging to the model that will actually forward."""
+    for _, router in iter_model_routers(model):
+        router.set_router_replay_action(router_replay_action)
 
 
 def reorder_and_merge_vpp_layers(
