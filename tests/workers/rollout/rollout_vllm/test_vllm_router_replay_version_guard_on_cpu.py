@@ -69,6 +69,7 @@ def _load_routing_replay_block(installed_version: str):
     module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
     namespace = {
         "_VLLM_VERSION": version.parse(installed_version),
+        "is_mtp_rollout_enabled": lambda config, model_config: config.mtp_rollout_enabled,
         "version": version,
         "vllm": SimpleNamespace(__version__=installed_version),
     }
@@ -76,8 +77,14 @@ def _load_routing_replay_block(installed_version: str):
     return namespace["apply_routing_replay_config"]
 
 
-def _server_with_routing_replay(enabled: bool):
-    return SimpleNamespace(config=SimpleNamespace(enable_rollout_routing_replay=enabled))
+def _server_with_routing_replay(enabled: bool, mtp_rollout_enabled: bool = False):
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            enable_rollout_routing_replay=enabled,
+            mtp_rollout_enabled=mtp_rollout_enabled,
+        ),
+        model_config=SimpleNamespace(),
+    )
 
 
 def test_router_replay_rejects_vllm_older_than_022():
@@ -93,3 +100,16 @@ def test_router_replay_accepts_vllm_022_and_preserves_disabled_behavior():
 
     apply_old_config = _load_routing_replay_block("0.21.1")
     assert apply_old_config(_server_with_routing_replay(False), {}) == {}
+
+
+def test_router_replay_with_mtp_speculation_requires_vllm_026():
+    apply_old_config = _load_routing_replay_block("0.25.1")
+    with pytest.raises(RuntimeError, match=r"MTP speculative rollout with router replay requires vLLM >= 0\.26\.0"):
+        apply_old_config(_server_with_routing_replay(True, mtp_rollout_enabled=True), {})
+
+    assert apply_old_config(_server_with_routing_replay(True), {}) == {"enable_return_routed_experts": True}
+
+    apply_supported_config = _load_routing_replay_block("0.26.0")
+    assert apply_supported_config(_server_with_routing_replay(True, mtp_rollout_enabled=True), {}) == {
+        "enable_return_routed_experts": True
+    }

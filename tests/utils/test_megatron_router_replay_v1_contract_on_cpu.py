@@ -48,6 +48,13 @@ def test_worker_enables_replay_only_for_actor_compute_and_update():
     assert source.count("@_with_routing_replay_flag(enabled=False)") == 1
 
 
+def test_worker_serializes_grad_norm_as_a_host_scalar():
+    postprocess = ast.unparse(_class_method(ENGINE_WORKER_PATH, "TrainingWorker", "_postprocess_output"))
+
+    assert "isinstance(grad_norm, torch.Tensor)" in postprocess
+    assert "grad_norm.detach().item()" in postprocess
+
+
 def test_engine_replays_live_decoder_routes_and_always_clears_state():
     forward_backward = ast.unparse(_class_method(ENGINE_PATH, "MegatronEngine", "forward_backward_batch"))
     forward_step = ast.unparse(_class_method(ENGINE_PATH, "MegatronEngineWithLMHead", "forward_step"))
@@ -64,6 +71,14 @@ def test_engine_replays_live_decoder_routes_and_always_clears_state():
     assert "virtual_pipeline_model_parallel_size is not None" in ENGINE_PATH.read_text(encoding="utf-8")
 
 
+def test_engine_uses_the_matching_bridge_weight_export_api():
+    export_source = ast.unparse(_class_method(ENGINE_PATH, "MegatronEngine", "get_per_tensor_param"))
+
+    assert "if self.vanilla_bridge:" in export_source
+    assert "self.bridge.export_weights(self.module)" in export_source
+    assert "self.bridge.export_hf_weights(self.module)" in export_source
+
+
 def test_route_transport_and_launcher_keep_parity_guards():
     padding_source = PADDING_PATH.read_text(encoding="utf-8")
     launcher_source = LAUNCHER_PATH.read_text(encoding="utf-8")
@@ -75,10 +90,18 @@ def test_route_transport_and_launcher_keep_parity_guards():
     assert "route_layer_count == tf_config.num_layers" in replay_utils_source
     assert "route_layer_count == moe_layer_count" in replay_utils_source
     for expected in (
-        "export VLLM_BATCH_INVARIANT=1",
+        "export VLLM_BATCH_INVARIANT=0",
+        "MTP_ROLLOUT_SPEC=${MTP_ROLLOUT_SPEC:-1}",
+        "TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}",
+        "ROLLOUT_N=${ROLLOUT_N:-2}",
+        "data.seed=${SEED}",
+        "actor_rollout_ref.actor.data_loader_seed=${SEED}",
+        "actor_rollout_ref.actor.megatron.seed=${SEED}",
         "actor_rollout_ref.actor.megatron.router_replay.mode=${ROUTER_REPLAY_MODE}",
         "actor_rollout_ref.rollout.enable_rollout_routing_replay=${ROLLOUT_ROUTING_REPLAY_ENABLED}",
+        "actor_rollout_ref.rollout.enable_prefix_caching=${ROLLOUT_ENABLE_PREFIX_CACHING}",
         "actor_rollout_ref.rollout.logprobs_mode=raw_logprobs",
+        "actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}",
         "+actor_rollout_ref.rollout.repetition_penalty=${ROLLOUT_REPETITION_PENALTY}",
         "override_transformer_config.moe_router_fusion=False",
         "R3 raw-logprob parity requires ROLLOUT_TEMPERATURE=1.0",

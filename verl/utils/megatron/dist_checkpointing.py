@@ -14,20 +14,20 @@
 
 import torch
 from megatron.core import dist_checkpointing, mpu
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
+)
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
 )
 
 
 def save_dist_checkpointing(sharded_state_dict, ckpt_path, async_save=False):
     validate_sharding_integrity = True
     # Get checkpointing strategies
-    save_strategy = get_default_save_sharded_strategy("torch_dist")
+    save_strategy = TorchDistSaveShardedStrategy(backend="torch_dist", version=1)
     save_strategy = FullyParallelSaveStrategyWrapper(
         save_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
     )
@@ -46,7 +46,7 @@ def save_dist_checkpointing(sharded_state_dict, ckpt_path, async_save=False):
 
 def load_dist_checkpointing(sharded_state_dict, ckpt_dir):
     # Get checkpointing strategies
-    load_strategy = get_default_load_sharded_strategy(ckpt_dir)
+    load_strategy = TorchDistLoadShardedStrategy()
     load_strategy = FullyParallelLoadStrategyWrapper(
         load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
     )

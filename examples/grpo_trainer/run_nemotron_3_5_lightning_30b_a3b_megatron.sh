@@ -2,10 +2,9 @@
 # GRPO | NVIDIA Nemotron 3.5 Lightning 30B-A3B | Megatron actor | vLLM rollout
 # DAPO-style recipe on DAPO-Math-17k / AIME-2024.
 #
-# EXPERIMENTAL: ordinary BF16 rollout without router replay passed a two-hour,
-# 37-step hardware soak. The R3 router-replay default, convergence, checkpoint
-# restore, quantized synchronization, alternate topologies, and optional MTP
-# speculative rollout remain unvalidated.
+# Hardware validation completed a four-hour, 261-step BF16 soak with R3 router
+# replay and one-token MTP speculative rollout enabled. Convergence, checkpoint
+# restore, quantized synchronization, and alternate topologies remain unvalidated.
 #
 # This is a verl adaptation; NVIDIA has not published a Lightning-specific
 # GRPO recipe. The 2x8 H100 actor topology starts from NVIDIA's verified SFT
@@ -19,8 +18,8 @@
 #
 # Use the BF16 customization checkpoint. Quantized Lightning checkpoints and
 # quantized actor-to-rollout weight updates are intentionally not enabled here.
-# One-token MTP rollout speculation remains available only when router replay is
-# disabled. It was not enabled in the hardware soak.
+# One-token MTP rollout speculation can be combined with R3 when vLLM >= 0.26;
+# older versions may capture draft-model router decisions as target routes.
 # Checkpoint revision used for hardware validation:
 #   d468880b6ad3c6e0d21377ce7242adaea4cc884d
 # Dataset revisions used for hardware validation:
@@ -30,15 +29,19 @@
 set -xeuo pipefail
 
 export VLLM_USE_V1=1
-export VLLM_BATCH_INVARIANT=1
+# Nemotron's hybrid Mamba2 attention is not supported by vLLM's
+# batch-invariant mode. Keep the setting explicit so inherited environments
+# cannot turn it on accidentally.
+export VLLM_BATCH_INVARIANT=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 ########################### user-adjustable ###########################
 PYTHON_BIN=${PYTHON_BIN:-python3}
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 ROUTER_REPLAY_MODE=${ROUTER_REPLAY_MODE:-R3}
-MTP_ROLLOUT_SPEC=${MTP_ROLLOUT_SPEC:-0}
+MTP_ROLLOUT_SPEC=${MTP_ROLLOUT_SPEC:-1}
 NUM_SPECULATIVE_TOKENS=${NUM_SPECULATIVE_TOKENS:-1}
+SEED=${SEED:-42}
 
 DATA_DIR=${DATA_DIR:-${HOME}/verl}
 MODEL_PATH=${MODEL_PATH:-nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16}
@@ -49,8 +52,8 @@ VAL_FILES=${VAL_FILES:-${DATA_DIR}/data/aime-2024.parquet}
 NNODES=${NNODES:-2}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-${GPUS_PER_NODE:-8}}
 
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-32}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-32}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
 PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
@@ -70,9 +73,11 @@ ALL_OFFLOAD=${ALL_OFFLOAD:-True}
 
 ROLLOUT_TP=${ROLLOUT_TP:-8}
 ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.70}
-ROLLOUT_N=${ROLLOUT_N:-8}
+ROLLOUT_N=${ROLLOUT_N:-2}
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}
+ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-32}
 ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN:-4096}
+ROLLOUT_ENABLE_PREFIX_CACHING=${ROLLOUT_ENABLE_PREFIX_CACHING:-False}
 ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
 ROLLOUT_TOP_P=${ROLLOUT_TOP_P:-1.0}
 ROLLOUT_REPETITION_PENALTY=${ROLLOUT_REPETITION_PENALTY:-1.0}
@@ -137,11 +142,6 @@ if [ "${ROUTER_REPLAY_MODE}" = R3 ] && [[ ! "${ROLLOUT_TEMPERATURE}" =~ ^1([.]0+
     exit 1
 fi
 
-if [ "${ROUTER_REPLAY_MODE}" = R3 ] && [ "${MTP_ROLLOUT_SPEC}" = 1 ]; then
-    echo "R3 router replay with MTP speculative rollout is not supported; set MTP_ROLLOUT_SPEC=0." >&2
-    exit 1
-fi
-
 if [ "${MTP_ROLLOUT_SPEC}" = 1 ] && [ "${NUM_SPECULATIVE_TOKENS}" -ne 1 ]; then
     echo "Lightning's Nemotron-H MTP rollout currently supports NUM_SPECULATIVE_TOKENS=1 only." >&2
     exit 1
@@ -168,6 +168,7 @@ REWARD=(
 DATA=(
     data.train_files="${TRAIN_FILES}"
     data.val_files="${VAL_FILES}"
+    data.seed=${SEED}
     data.train_batch_size=${TRAIN_BATCH_SIZE}
     data.prompt_key=prompt
     data.return_raw_chat=True
@@ -195,6 +196,7 @@ MODEL=(
 )
 
 ACTOR=(
+    actor_rollout_ref.actor.data_loader_seed=${SEED}
     actor_rollout_ref.actor.optim.lr=${ACTOR_LR}
     actor_rollout_ref.actor.optim.lr_warmup_steps=10
     actor_rollout_ref.actor.optim.lr_decay_style=constant
@@ -218,6 +220,7 @@ ACTOR=(
     actor_rollout_ref.actor.megatron.context_parallel_size=${ACTOR_CP}
     actor_rollout_ref.actor.megatron.expert_model_parallel_size=${ACTOR_EP}
     actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${ACTOR_ETP}
+    actor_rollout_ref.actor.megatron.seed=${SEED}
     actor_rollout_ref.actor.megatron.router_replay.mode=${ROUTER_REPLAY_MODE}
     actor_rollout_ref.actor.megatron.sequence_parallel=True
     actor_rollout_ref.actor.megatron.param_offload=${ALL_OFFLOAD}
@@ -263,9 +266,11 @@ ROLLOUT=(
     actor_rollout_ref.rollout.calculate_log_probs=True
     actor_rollout_ref.rollout.logprobs_mode=raw_logprobs
     actor_rollout_ref.rollout.enable_rollout_routing_replay=${ROLLOUT_ROUTING_REPLAY_ENABLED}
+    actor_rollout_ref.rollout.enable_prefix_caching=${ROLLOUT_ENABLE_PREFIX_CACHING}
     actor_rollout_ref.rollout.enable_chunked_prefill=True
     +actor_rollout_ref.rollout.enable_sleep_mode=True
     actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}
+    actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}
     actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN}
     actor_rollout_ref.rollout.prompt_length=${MAX_PROMPT_LENGTH}
     actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}

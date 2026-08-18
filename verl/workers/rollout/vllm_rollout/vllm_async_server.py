@@ -431,6 +431,12 @@ class vLLMHttpServerBase:
                     f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
                     "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
                 )
+            if is_mtp_rollout_enabled(self.config, self.model_config) and _VLLM_VERSION < version.parse("0.26.0"):
+                raise RuntimeError(
+                    "MTP speculative rollout with router replay requires vLLM >= 0.26.0 "
+                    f"(installed: {vllm.__version__}) so routed-expert capture excludes draft routers. "
+                    "Upgrade vLLM, disable MTP rollout speculation, or disable router replay."
+                )
             args.update({"enable_return_routed_experts": True})
 
         server_args = ["serve", self.model_config.local_path]
