@@ -387,6 +387,7 @@ class MegatronEngine(BaseEngine):
             bridge=self.bridge,
             provider=self.provider,
             use_dist_checkpointing=self.engine_config.use_dist_checkpointing,
+            peft_cls=self.peft_cls,
         )
 
         self.to(
@@ -661,8 +662,9 @@ class MegatronEngine(BaseEngine):
         if self.vanilla_bridge:
             per_tensor_param = self.bridge.export_weights(self.module)
         else:
+            # Megatron-Bridge folds active adapters into the exported Hugging
+            # Face tensors consumed by rollout weight synchronization.
             per_tensor_param = self.bridge.export_hf_weights(self.module)
-        # TODO: support megatron LoRA
         return per_tensor_param, None
 
     def forward_step(self, batch_iter, model, postprocess_micro_batch_func):

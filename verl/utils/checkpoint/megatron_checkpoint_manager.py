@@ -496,6 +496,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     adapter_ckpt_path,
                     self.rank,
                 )
+                torch.distributed.barrier()
 
                 log_with_rank(
                     f"Saved adapter-only checkpoint to {adapter_ckpt_path}",
@@ -503,7 +504,9 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     logger=logger,
                     log_only_rank_0=True,
                 )
-            if self.use_hf_checkpoint:
+            # PEFT resumes from the immutable base model plus adapter weights.
+            # Export merged Hugging Face weights only when explicitly requested.
+            if self.use_hf_checkpoint and (self.peft_cls is None or self.should_save_hf_model):
                 # Use mbridge to save HF model checkpoint
                 log_with_rank(f"Saving HF model checkpoint to {local_path} with bridge", rank=self.rank, logger=logger)
                 hf_ckpt_path = get_hf_model_checkpoint_path(local_path)
@@ -550,15 +553,20 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     "grad_sync_func",
                     "param_sync_func",
                     "generation_config",
+                    # Runtime-only process groups cannot be deep-copied by
+                    # dataclasses.asdict and must be rebuilt on resume.
+                    "_pg_collection",
                 ]
                 backup = {}
-                for k in bypass_keys:
-                    if hasattr(self.transformer_config, k):
-                        backup[k] = getattr(self.transformer_config, k, None)
-                        delattr(self.transformer_config, k)
-                transformer_config_dict = asdict(self.transformer_config)
-                for k in backup:
-                    setattr(self.transformer_config, k, backup[k])
+                try:
+                    for k in bypass_keys:
+                        if hasattr(self.transformer_config, k):
+                            backup[k] = getattr(self.transformer_config, k, None)
+                            setattr(self.transformer_config, k, None)
+                    transformer_config_dict = asdict(self.transformer_config)
+                finally:
+                    for k, value in backup.items():
+                        setattr(self.transformer_config, k, value)
                 to_convert_types = {torch.dtype: str, AttnBackend: str}
                 ignore_types = [Callable]
                 pop_keys = []
@@ -573,7 +581,10 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     transformer_config_dict.pop(key)
                 transformer_config_path = get_transformer_config_checkpoint_path(local_path)
                 with open(transformer_config_path, "w") as f:
-                    json.dump(transformer_config_dict, f, indent=2)
+                    # Megatron config fields can be enum-like runtime values
+                    # (for example InferenceCudaGraphScope). They are metadata,
+                    # so preserve their readable representation in JSON.
+                    json.dump(transformer_config_dict, f, indent=2, default=str)
 
         if self.should_save_hf_model and not self.use_hf_checkpoint:
             # wait for everyone to dump to local

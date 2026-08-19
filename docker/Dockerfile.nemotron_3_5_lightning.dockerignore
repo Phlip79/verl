@@ -9,9 +9,11 @@
 !examples/data_preprocess/gsm8k_multiturn_sft.py
 !examples/grpo_trainer
 !examples/grpo_trainer/run_nemotron_3_5_lightning_30b_a3b_megatron.sh
+!examples/grpo_trainer/run_nemotron_3_5_lightning_30b_a3b_megatron_lora.sh
 !examples/sft
 !examples/sft/gsm8k
 !examples/sft/gsm8k/run_nemotron_3_5_lightning_megatron.sh
+!examples/sft/gsm8k/run_nemotron_3_5_lightning_megatron_lora.sh
 !verl
 !verl/**
 !docker
