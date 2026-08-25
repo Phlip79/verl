@@ -23,7 +23,29 @@ from ...utils.profiler import ProfilerConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["FSDPEngineConfig", "McoreEngineConfig", "TrainingWorkerConfig", "VeOmniEngineConfig"]
+__all__ = [
+    "EngineConfig",
+    "EngineRouterReplayConfig",
+    "FSDPEngineConfig",
+    "McoreEngineConfig",
+    "TrainingWorkerConfig",
+    "VeOmniEngineConfig",
+]
+
+
+# TODO: rename to RouterReplayConfig after removing the legacy worker implementation.
+@dataclass
+class EngineRouterReplayConfig(BaseConfig):
+    """Router replay configuration for the V1 model engine."""
+
+    mode: str = "disabled"
+    record_file: Optional[str] = None
+    replay_file: Optional[str] = None
+
+    def __post_init__(self):
+        valid_modes = ["disabled", "R2", "R3"]
+        if self.mode not in valid_modes:
+            raise ValueError(f"Invalid router_replay mode: {self.mode}. Must be one of {valid_modes}")
 
 
 @dataclass
@@ -66,6 +88,7 @@ class EngineConfig(BaseConfig):
     seed: int = 42
 
     full_determinism: bool = False
+    router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
 
     def __post_init__(self):
         pass

@@ -19,6 +19,15 @@ from pathlib import Path
 import torch
 
 
+def _is_adapter_checkpoint_writer() -> bool:
+    """Return whether this rank owns the checkpoint copy of its adapter shard."""
+    from megatron.core import mpu
+
+    # EP ranks own different expert shards, while expert-DP and CP ranks hold
+    # replicas. One expert-DP/CP replica writes each TP/PP/EP checkpoint path.
+    return mpu.get_expert_data_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0
+
+
 def _get_rank_checkpoint_path(base_path: str) -> str:
     """Get rank-specific checkpoint path following Megatron's convention.
 
@@ -84,8 +93,8 @@ def save_adapter_checkpoint(
     This is much more efficient than saving the full model when using PEFT,
     as adapters typically represent <1% of total parameters.
 
-    Uses Megatron's distributed checkpoint structure: each rank saves to
-    checkpoint_path/mp_rank_{tp:02d}_{pp:03d}/adapter.pt
+    Uses Megatron's distributed checkpoint structure. One CP/expert-DP replica
+    writes each TP/PP/EP adapter shard.
 
     Args:
         model: Model or list of models
@@ -97,6 +106,9 @@ def save_adapter_checkpoint(
         models = model
     else:
         models = [model]
+
+    if not _is_adapter_checkpoint_writer():
+        return
 
     # Get adapter state from first model
     adapter_state = get_adapter_state_dict(models[0])

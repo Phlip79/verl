@@ -24,6 +24,7 @@ from typing import Any, Callable, Optional
 import cloudpickle as pickle
 import numpy as np
 import ray
+import uvicorn
 import vllm.entrypoints.cli.serve
 import zmq
 from packaging import version
@@ -39,7 +40,6 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
-from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
 
@@ -48,13 +48,18 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
-from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address, run_unvicorn
+from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
     VLLM_LORA_PATH,
+    build_mtp_speculative_config,
+    get_config_value,
+    get_max_position_embeddings,
+    get_mtp_config,
     get_vllm_max_lora_rank,
+    is_mtp_rollout_enabled,
 )
 
 _VLLM_VERSION = version.parse(vllm.__version__)
@@ -77,6 +82,43 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+class _UvicornServerAutoPort(uvicorn.Server):
+    """Report the system-assigned port after uvicorn finishes startup."""
+
+    def __init__(self, config: uvicorn.Config) -> None:
+        super().__init__(config)
+        self.actual_port: int | None = None
+        self._startup_done = asyncio.Event()
+
+    async def startup(self, sockets=None) -> None:
+        try:
+            await super().startup(sockets=sockets)
+            if self.servers and self.config.port == 0:
+                self.actual_port = self.servers[0].sockets[0].getsockname()[1]
+            else:
+                self.actual_port = self.config.port
+        finally:
+            self._startup_done.set()
+
+    async def get_port(self) -> int | None:
+        await self._startup_done.wait()
+        return self.actual_port
+
+
+async def _run_uvicorn(app, server_args, server_address: str) -> tuple[int, asyncio.Task]:
+    """Start uvicorn without the should_exit bootstrap removed in uvicorn 0.41."""
+    app.server_args = server_args
+    config = uvicorn.Config(app, host=server_address, port=0, log_level="warning")
+    server = _UvicornServerAutoPort(config)
+    server_task = asyncio.create_task(server.serve())
+    server_port = await server.get_port()
+    if server_port is None:
+        await server_task
+        raise RuntimeError("HTTP server started without reporting a listening port")
+    logger.info(f"HTTP server started on port {server_port}")
+    return server_port, server_task
+
+
 class ExternalZeroMQDistributedExecutor(Executor):
     """An executor that engines are launched by external ray actors."""
 
@@ -84,6 +126,11 @@ class ExternalZeroMQDistributedExecutor(Executor):
 
     def _init_executor(self) -> None:
         dp_rank_local = self.vllm_config.parallel_config.data_parallel_rank_local
+        if dp_rank_local is None:
+            # vLLM 0.27 leaves this unset outside SPMD mode, including the
+            # common data_parallel_size=1 GRPO topology.
+            dp_size_local = self.vllm_config.parallel_config.data_parallel_size_local or 1
+            dp_rank_local = self.vllm_config.parallel_config.data_parallel_rank % dp_size_local
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
 
         addresses = os.environ["VERL_VLLM_ZMQ_ADDRESSES"].split(",")
@@ -138,8 +185,8 @@ class ExternalZeroMQDistributedExecutor(Executor):
         timeout: Optional[float] = None,
         args: tuple = (),
         kwargs: Optional[dict[str, Any]] = None,
-        **kwargs_extra: Any,
-    ) -> list[Any]:
+        non_block: bool = False,
+    ) -> list[Any] | Future[list[Any]]:
         if isinstance(method, str):
             sent_method = method
         else:
@@ -157,6 +204,10 @@ class ExternalZeroMQDistributedExecutor(Executor):
         for output in outputs:
             if isinstance(output, Exception):
                 raise output
+        if non_block:
+            future = Future()
+            future.set_result(outputs)
+            return future
         return outputs
 
     def check_health(self):
@@ -195,7 +246,14 @@ class vLLMHttpServerBase:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = self.model_config.hf_config.max_position_embeddings
+        max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
+        if self.config.max_model_len is None:
+            self.config.max_model_len = max_position_embeddings
+        elif self.config.max_model_len > max_position_embeddings:
+            raise ValueError(
+                f"max_model_len ({self.config.max_model_len}) must be less than or equal to "
+                f"max_position_embeddings ({max_position_embeddings})"
+            )
         self.rollout_mode = rollout_mode
         self.workers = workers
 
@@ -315,6 +373,14 @@ class vLLMHttpServerBase:
             **engine_kwargs,
         }
 
+        if is_mtp_rollout_enabled(self.config, self.model_config):
+            mtp_config = get_mtp_config(self.config, self.model_config)
+            args["speculative_config"] = build_mtp_speculative_config(
+                get_config_value(mtp_config, "method", "mtp"),
+                get_config_value(mtp_config, "num_speculative_tokens", 1),
+                args.get("speculative_config"),
+            )
+
         if self.config.prometheus.enable:
             if self.config.prometheus.served_model_name:
                 # Extract model name from path if it's a full path
@@ -356,6 +422,21 @@ class vLLMHttpServerBase:
             )
 
         if self.config.enable_rollout_routing_replay:
+            # R3 relies on vLLM's routed-experts capture path. For hybrid-attention
+            # MoE models this path is only correct starting with vLLM 0.22.0;
+            # earlier releases under-size the host buffer and fail during rollout.
+            if _VLLM_VERSION < version.parse("0.22.0"):
+                raise RuntimeError(
+                    "rollout.enable_rollout_routing_replay=True requires vLLM >= 0.22.0 "
+                    f"(installed: {vllm.__version__}). Upgrade vLLM (e.g. `pip install -U "
+                    "'vllm>=0.22.0'`) or disable enable_rollout_routing_replay."
+                )
+            if is_mtp_rollout_enabled(self.config, self.model_config) and _VLLM_VERSION < version.parse("0.26.0"):
+                raise RuntimeError(
+                    "MTP speculative rollout with router replay requires vLLM >= 0.26.0 "
+                    f"(installed: {vllm.__version__}) so routed-expert capture excludes draft routers. "
+                    "Upgrade vLLM, disable MTP rollout speculation, or disable router replay."
+                )
             args.update({"enable_return_routed_experts": True})
 
         server_args = ["serve", self.model_config.local_path]
@@ -420,35 +501,47 @@ class vLLMHttpServerBase:
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
 
-        app = build_app(args)
-        if _VLLM_VERSION > version.parse("0.11.0"):
-            await init_app_state(engine_client, app.state, args)
-        else:
+        build_app_signature = inspect.signature(build_app)
+        supported_tasks: tuple[Any, ...] = ()
+        build_app_kwargs: dict[str, Any] = {}
+        if "supported_tasks" in build_app_signature.parameters:
+            supported_tasks = await engine_client.get_supported_tasks()
+            build_app_kwargs["supported_tasks"] = supported_tasks
+        if "model_config" in build_app_signature.parameters:
+            build_app_kwargs["model_config"] = vllm_config.model_config
+        app = build_app(args, **build_app_kwargs)
+
+        init_app_signature = inspect.signature(init_app_state)
+        if "vllm_config" in init_app_signature.parameters:
             await init_app_state(engine_client, vllm_config, app.state, args)
+        elif "supported_tasks" in init_app_signature.parameters:
+            await init_app_state(engine_client, app.state, args, supported_tasks)
+        else:
+            await init_app_state(engine_client, app.state, args)
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
         self.engine = engine_client
-        self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
+        self._server_port, self._server_task = await _run_uvicorn(app, args, self._server_address)
 
     async def run_headless(self, args: argparse.Namespace):
-        # Create the EngineConfig.
-        engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+        """Launch exact-vLLM headless cores while retaining the external executor."""
+        engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context, headless=True)
 
         parallel_config = vllm_config.parallel_config
         local_engine_count = parallel_config.data_parallel_size_local
-
         host = parallel_config.data_parallel_master_ip
-        port = engine_args.data_parallel_rpc_port  # add to config too
-        handshake_address = get_tcp_uri(host, port)
+        handshake_address = get_tcp_uri(host, engine_args.data_parallel_rpc_port)
 
-        # Create the engines.
+        # Do not delegate to vLLM's CLI run_headless here. For nonzero node
+        # ranks vLLM 0.27 hardcodes MultiprocExecutor there, bypassing verl's
+        # external Ray/ZMQ workers. CoreEngineProcManager still accepts the
+        # configured custom executor; only the obsolete target_fn was removed.
         self.engine_manager = CoreEngineProcManager(
-            target_fn=EngineCoreProc.run_engine_core,
             local_engine_count=local_engine_count,
-            start_index=vllm_config.parallel_config.data_parallel_rank,
+            start_index=parallel_config.data_parallel_rank,
             local_start_index=0,
             vllm_config=vllm_config,
             local_client=False,
@@ -456,6 +549,22 @@ class vLLMHttpServerBase:
             executor_class=Executor.get_class(vllm_config),
             log_stats=not engine_args.disable_log_stats,
         )
+
+        def on_run_headless_done(future: asyncio.Future):
+            try:
+                exc = future.exception()
+                if exc is not None:
+                    logger.error(
+                        "vLLM headless server stopped with an exception",
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+                else:
+                    logger.error("vLLM headless server stopped unexpectedly")
+            finally:
+                os._exit(1)
+
+        self._headless_task = asyncio.create_task(asyncio.to_thread(self.engine_manager.monitor_engine_liveness))
+        self._headless_task.add_done_callback(on_run_headless_done)
 
     async def generate(
         self,

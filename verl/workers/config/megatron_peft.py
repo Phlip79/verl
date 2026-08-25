@@ -11,33 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PEFT configuration of Megatron for VERL."""
+"""PEFT configuration of Megatron for verl."""
 
 
-def get_peft_cls(model_config, bridge, provider, dtype=None):
-    """Get PEFT class from model config.
+def _create_legacy_peft(lora_cfg, dtype=None):
+    """Create PEFT objects with the Megatron-Bridge <0.5 API."""
 
-    Args:
-        model_config: Model configuration object.
-        bridge: Megatron-Bridge AutoBridge instance.
-        provider: Provider instance.
-
-    Returns:
-        PEFT configuration object (LoRAConfig, CanonicalLoRAConfig, DoRAConfig) or None.
-    """
-
-    peft_cls = None
-    if not hasattr(model_config, "lora"):
-        return peft_cls
-
-    lora_cfg = model_config.lora
-    # Only enable if rank > 0
-    if lora_cfg.get("rank", 0) <= 0:
-        return peft_cls
-
-    assert bridge is not None and provider is not None, "LoRA/PEFT only supported via Megatron-Bridge"
-
-    from verl.models.mcore.bridge import CanonicalLoRA, DoRA, LoRA, VLMLoRA
+    from megatron.bridge.peft.canonical_lora import CanonicalLoRA
+    from megatron.bridge.peft.dora import DoRA
+    from megatron.bridge.peft.lora import LoRA, VLMLoRA
 
     lora_dtype = lora_cfg.get("dtype", dtype)
     if lora_dtype is not None:
@@ -45,72 +27,71 @@ def get_peft_cls(model_config, bridge, provider, dtype=None):
 
         lora_dtype = PrecisionType.to_dtype(lora_dtype)
 
+    common_kwargs = {
+        "target_modules": lora_cfg.get("target_modules", ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"]),
+        "dim": lora_cfg.get("rank"),
+        "alpha": lora_cfg.get("alpha", 32),
+        "dropout": lora_cfg.get("dropout", 0.0),
+        "dropout_position": lora_cfg.get("dropout_position", "pre"),
+        "lora_A_init_method": lora_cfg.get("lora_A_init_method", "xavier"),
+        "lora_B_init_method": lora_cfg.get("lora_B_init_method", "zero"),
+        "exclude_modules": lora_cfg.get("exclude_modules", []),
+    }
+
     lora_type = lora_cfg.get("type", "lora")
     if lora_type == "lora":
-        peft_cls = LoRA(
-            target_modules=lora_cfg.get("target_modules", ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"]),
-            dim=lora_cfg.get("rank"),
-            alpha=lora_cfg.get("alpha", 32),
-            dropout=lora_cfg.get("dropout", 0.0),
-            dropout_position=lora_cfg.get("dropout_position", "pre"),
-            lora_A_init_method=lora_cfg.get("lora_A_init_method", "xavier"),
-            lora_B_init_method=lora_cfg.get("lora_B_init_method", "zero"),
+        return LoRA(
+            **common_kwargs,
             a2a_experimental=lora_cfg.get("a2a_experimental", False),
             lora_dtype=lora_dtype,
-            exclude_modules=lora_cfg.get("exclude_modules", []),
         )
     if lora_type == "vlm_lora":
-        peft_cls = VLMLoRA(
-            target_modules=lora_cfg.get("target_modules", ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"]),
-            dim=lora_cfg.get("rank"),
-            alpha=lora_cfg.get("alpha", 32),
-            dropout=lora_cfg.get("dropout", 0.0),
-            dropout_position=lora_cfg.get("dropout_position", "pre"),
-            lora_A_init_method=lora_cfg.get("lora_A_init_method", "xavier"),
-            lora_B_init_method=lora_cfg.get("lora_B_init_method", "zero"),
+        return VLMLoRA(
+            **common_kwargs,
             a2a_experimental=lora_cfg.get("a2a_experimental", False),
             lora_dtype=lora_dtype,
             freeze_vision_model=lora_cfg.get("freeze_vision_model", True),
             freeze_vision_projection=lora_cfg.get("freeze_vision_projection", True),
             freeze_language_model=lora_cfg.get("freeze_language_model", True),
-            exclude_modules=lora_cfg.get("exclude_modules", []),
         )
-    elif lora_type == "canonical_lora":
-        peft_cls = CanonicalLoRA(
-            target_modules=lora_cfg.get(
-                "target_modules",
-                [
-                    "linear_q",
-                    "linear_k",
-                    "linear_v",
-                    "linear_proj",
-                    "linear_fc1_up",
-                    "linear_fc1_gate",
-                    "linear_fc2",
-                ],
-            ),
-            dim=lora_cfg.get("rank"),
-            alpha=lora_cfg.get("alpha", 32),
-            dropout=lora_cfg.get("dropout", 0.0),
-            dropout_position=lora_cfg.get("dropout_position", "pre"),
-            lora_A_init_method=lora_cfg.get("lora_A_init_method", "xavier"),
-            lora_B_init_method=lora_cfg.get("lora_B_init_method", "zero"),
-            exclude_modules=lora_cfg.get("exclude_modules", []),
+    if lora_type == "canonical_lora":
+        common_kwargs["target_modules"] = lora_cfg.get(
+            "target_modules",
+            [
+                "linear_q",
+                "linear_k",
+                "linear_v",
+                "linear_proj",
+                "linear_fc1_up",
+                "linear_fc1_gate",
+                "linear_fc2",
+            ],
         )
-    elif lora_type == "dora":
-        peft_cls = DoRA(
-            target_modules=lora_cfg.get("target_modules", ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"]),
-            dim=lora_cfg.get("rank"),
-            alpha=lora_cfg.get("alpha", 32),
-            dropout=lora_cfg.get("dropout", 0.0),
-            dropout_position=lora_cfg.get("dropout_position", "pre"),
-            lora_A_init_method=lora_cfg.get("lora_A_init_method", "xavier"),
-            lora_B_init_method=lora_cfg.get("lora_B_init_method", "zero"),
-            exclude_modules=lora_cfg.get("exclude_modules", []),
-        )
+        return CanonicalLoRA(**common_kwargs)
+    if lora_type == "dora":
+        return DoRA(**common_kwargs)
+    return None
 
+
+def get_peft_cls(model_config, bridge, provider, dtype=None):
+    """Create a Megatron-Bridge PEFT object from ``model_config.lora``."""
+    if not hasattr(model_config, "lora"):
+        return None
+
+    lora_cfg = model_config.lora
+    if lora_cfg.get("rank", 0) <= 0:
+        return None
+
+    assert bridge is not None and provider is not None, "LoRA/PEFT only supported via Megatron-Bridge"
+
+    try:
+        from megatron.bridge.peft.utils import create_peft
+    except (ImportError, AttributeError):
+        peft_cls = _create_legacy_peft(lora_cfg, dtype=dtype)
+    else:
+        peft_cls = create_peft(lora_cfg, dtype=dtype)
     print(
-        f"Enabling {lora_type.upper()} with rank={lora_cfg.get('rank')}, "
+        f"Enabling {lora_cfg.get('type', 'lora').upper()} with rank={lora_cfg.get('rank')}, "
         f"alpha={lora_cfg.get('alpha')}, dropout={lora_cfg.get('dropout')}"
     )
     return peft_cls

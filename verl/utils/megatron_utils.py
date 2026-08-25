@@ -18,6 +18,7 @@
 
 import gc
 import inspect
+import logging
 import os
 import warnings
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fs import local_mkdir_safe
 from verl.utils.model import normalize_model_name
 from verl.utils.torch_dtypes import PrecisionType
+
+logger = logging.getLogger(__name__)
 
 
 def get_model_config(model):
@@ -262,6 +265,8 @@ def make_megatron_module(
             model = provider.provide_distributed_model(
                 wrap_with_ddp=wrap_config.wrap_with_ddp,
                 ddp_config=ddp_config,
+                fp16=provider.fp16,
+                bf16=provider.bf16,
             )
 
             # Extract TransformerConfig from the created model
@@ -446,8 +451,15 @@ def load_megatron_model_to_gpu(models, load_grad=True):
                 for buffer in buffers:
                     # sometimes, we don't want to load grad for pure inference
                     if load_grad and hasattr(buffer, "grad_data_size"):
-                        buffer.grad_data.storage().resize_(buffer.grad_data_size)
-                        buffer.grad_data.zero_()
+                        current_storage_size = buffer.grad_data.storage().size()
+                        if current_storage_size == 0 or current_storage_size == buffer.grad_data_size:
+                            buffer.grad_data.storage().resize_(buffer.grad_data_size)
+                            buffer.grad_data.zero_()
+                        else:
+                            # Non-standard layers (e.g. GatedDeltaNet) may have grad
+                            # buffers with mismatched storage size; skip resize and
+                            # zero in-place with current storage.
+                            buffer.grad_data.zero_()
 
                     if buffer.param_data.storage().size() == 0:
                         buffer.param_data.storage().resize_(buffer.param_data_size)
@@ -1228,3 +1240,92 @@ def mapping_string_to_attn_backend(args: dict) -> dict:
 
         args["attention_backend"] = AttnBackend[args["attention_backend"]]
     return args
+
+
+def get_megatron_mtp_loss(n_micro_batch: int) -> dict[str, float]:
+    """Collect and clear MCore's auxiliary MTP loss tracker."""
+
+    from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+
+    tracker = MTPLossLoggingHelper.tracker
+    uses_global_token_mean = "loss_sums" in tracker and tracker.get("calculate_per_token_loss", True)
+    loss_scale = 1.0 if uses_global_token_mean else 1.0 / n_micro_batch
+    total_loss_dict = {}
+    MTPLossLoggingHelper.track_mtp_metrics(
+        loss_scale=loss_scale,
+        iteration=0,
+        writer=None,
+        wandb_writer=None,
+        total_loss_dict=total_loss_dict,
+    )
+    return {
+        f"mtp_losses/{key.replace(' ', '_')}": value.detach().cpu().item() for key, value in total_loss_dict.items()
+    }
+
+
+def _get_mtp_num_layers(hf_config) -> int:
+    """Read the MTP layer count used by supported HF config layouts."""
+
+    if getattr(hf_config, "num_nextn_predict_layers", 0) > 0:
+        return hf_config.num_nextn_predict_layers
+    if getattr(hf_config, "mtp_num_hidden_layers", 0) > 0:
+        return hf_config.mtp_num_hidden_layers
+    text_config = getattr(hf_config, "text_config", None)
+    if getattr(text_config, "mtp_num_hidden_layers", 0) > 0:
+        return text_config.mtp_num_hidden_layers
+    return 0
+
+
+def _set_mtp_num_layers(hf_config, value: int) -> None:
+    if hasattr(hf_config, "num_nextn_predict_layers"):
+        hf_config.num_nextn_predict_layers = value
+    if hasattr(hf_config, "mtp_num_hidden_layers"):
+        hf_config.mtp_num_hidden_layers = value
+    text_config = getattr(hf_config, "text_config", None)
+    if hasattr(text_config, "mtp_num_hidden_layers"):
+        text_config.mtp_num_hidden_layers = value
+
+
+def check_mtp_config(model_config, engine_config) -> None:
+    """Validate MTP intent and map it onto the Bridge provider overrides."""
+
+    hf_config = model_config.hf_config
+    mtp_num_layers = _get_mtp_num_layers(hf_config)
+    if not model_config.mtp.enable:
+        _set_mtp_num_layers(hf_config, 0)
+        # The external Bridge reloads HF config from local_path. The explicit
+        # override ensures forward-only/reference engines do not materialize
+        # ordinary MTP layers after that reload. Hybrid-only disable flags are
+        # added later, once the Bridge provider type is known.
+        engine_config.override_transformer_config["mtp_num_layers"] = None
+        engine_config.override_transformer_config.pop("mtp_loss_scaling_factor", None)
+        for hybrid_key in (
+            "mtp_hybrid_override_pattern",
+            "mtp_use_repeated_layer",
+            "keep_mtp_spec_in_bf16",
+        ):
+            engine_config.override_transformer_config.pop(hybrid_key, None)
+        return
+
+    if mtp_num_layers <= 0:
+        raise ValueError("MTP was enabled, but the model config does not declare any MTP layers")
+    if "mtp_loss_scaling_factor" not in engine_config.override_transformer_config:
+        engine_config.override_transformer_config["mtp_loss_scaling_factor"] = model_config.mtp.mtp_loss_scaling_factor
+
+
+def patch_engine_mtp(module, model_config) -> None:
+    """Select native HybridModel MTP and reject unsupported legacy GPT patching."""
+
+    from verl.models.mcore.mtp_support import is_native_hybrid_model
+
+    modules = module if isinstance(module, list) else [module]
+    for model in modules:
+        if is_native_hybrid_model(unwrap_model(model)):
+            if not model_config.mtp.enable_train:
+                raise ValueError("Native HybridModel requires model.mtp.enable_train=True when MTP is enabled")
+            logger.info("Using Megatron-Core native HybridModel MTP; legacy GPT patches are disabled.")
+            continue
+        raise NotImplementedError(
+            "This release/v0.7.0 backport supports native Megatron-Core HybridModel MTP only; "
+            "legacy GPT MTP monkey patches are intentionally not enabled."
+        )

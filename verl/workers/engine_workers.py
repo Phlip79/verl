@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import logging
 import os
+from copy import copy, deepcopy
 from functools import partial
 from itertools import chain
 from typing import Any, Optional
@@ -38,12 +40,27 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import allgather_dict_into_dict
-from verl.workers.config import ActorConfig, HFModelConfig, RolloutConfig, TrainingWorkerConfig
+from verl.workers.config import ActorConfig, HFModelConfig, MtpConfig, RolloutConfig, TrainingWorkerConfig
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
 from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _with_routing_replay_flag(enabled: bool):
+    """Tell a replay-enabled model engine whether this call should replay rollout routes."""
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, data: TensorDict, *args, **kwargs):
+            if self.enable_routing_replay:
+                tu.assign_non_tensor_data(data, "enable_routing_replay", enabled)
+            return func(self, data, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 class TrainingWorker(Worker, DistProfilerExtension):
@@ -149,6 +166,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         # For grad_norm, we do not perform all reduce because it is already been done when clipping grad
         grad_norm = metrics.pop("grad_norm", None)
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm = grad_norm.detach().item()
         lr = metrics.pop("lr", None)
 
         # For other metrics, we perform all gather in dp group
@@ -158,6 +177,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
             final_metrics["grad_norm"] = grad_norm
         if lr is not None:
             final_metrics["lr"] = lr
+        for key, value in list(final_metrics.items()):
+            if key.startswith("mtp_losses/"):
+                # MTP is one global tracker value inserted into the first
+                # micro-batch metrics on every DP rank.
+                flattened = [item[0] if isinstance(item, list) else item for item in value]
+                final_metrics[key] = sum(flattened) / len(flattened)
         # compute mfu
         if global_token_num is not None:
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_token_num, delta_time)
@@ -383,6 +408,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             tool_config = None
 
+        self.enable_routing_replay = (
+            self.config.actor.strategy == "megatron" and self.config.actor.megatron.router_replay.mode != "disabled"
+        )
+
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
         )
@@ -412,7 +441,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.use_dynamic_bsz = self.config.ref.pop("log_prob_use_dynamic_bsz", False)
                 self.config.ref.ppo_max_token_len_per_gpu = self.config.ref.pop("log_prob_max_token_len_per_gpu", None)
             ref_config: ActorConfig = omega_conf_to_dataclass(self.config.ref)
-            ref_config.model_config = model_config
+            # A reference policy only supplies ordinary next-token log-probs;
+            # do not materialize or execute the actor's auxiliary MTP heads.
+            # Tokenizers/processors can wrap native objects that are expensive
+            # or unsafe to deepcopy. Only the HF config is mutated while
+            # disabling MTP, so isolate that object and share the read-only
+            # runtime helpers.
+            ref_config.model_config = copy(model_config)
+            ref_config.model_config.hf_config = deepcopy(model_config.hf_config)
+            ref_config.model_config.mtp = MtpConfig(enable=False)
 
             # construct TrainingWorkerConfig
             ref_training_config = TrainingWorkerConfig(
@@ -514,18 +551,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
+    @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
+    @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.actor.infer_batch(data)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
+    @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None

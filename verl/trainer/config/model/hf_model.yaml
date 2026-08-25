@@ -9,6 +9,9 @@ _target_: verl.workers.config.HFModelConfig
 # path to the huggingface model
 path: ~/models/deepseek-llm-7b-chat
 
+# immutable Hugging Face revision for a remote model path
+revision: null
+
 # config to the huggingface config. In case it is not the same as path
 hf_config_path: null
 
@@ -75,3 +78,43 @@ tiled_mlp:
 
   # number of shards to split the input. Higher values reduce peak memory but may slightly impact performance.
   num_shards: 4
+
+# Multi-token prediction configuration. Native HybridModel checkpoints require
+# enable_train whenever MTP parameters are enabled.
+mtp:
+
+  # Target dataclass for MTP settings
+  _target_: verl.workers.config.MtpConfig
+
+  # whether to materialize MTP parameters
+  enable: False
+
+  # whether to train with the auxiliary MTP objective
+  enable_train: False
+
+  # whether rollout should use an MTP speculative drafter
+  enable_rollout: False
+
+  # whether auxiliary MTP gradients are detached from the base-model encoder
+  detach_encoder: False
+
+  # auxiliary MTP loss scaling factor
+  mtp_loss_scaling_factor: 0.1
+
+  # SGLang speculative decoding algorithm
+  speculative_algorithm: EAGLE
+
+  # SGLang speculative decoding steps
+  speculative_num_steps: 3
+
+  # SGLang EAGLE top-k
+  speculative_eagle_topk: 1
+
+  # SGLang number of draft tokens
+  speculative_num_draft_tokens: 4
+
+  # vLLM speculative decoding method
+  method: mtp
+
+  # vLLM number of speculative tokens
+  num_speculative_tokens: 1

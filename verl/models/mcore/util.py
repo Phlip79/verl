@@ -278,8 +278,12 @@ def postprocess_packed_seqs_for_dict_output(
 
 
 def preprocess_thd_no_padding(
-    input_ids: torch.Tensor, pre_process: bool = True, need_roll: bool = False
-) -> tuple[torch.Tensor, PackedSeqParams]:
+    input_ids: torch.Tensor,
+    pre_process: bool = True,
+    need_roll: bool = False,
+    include_total_tokens: bool = False,
+    return_position_ids: bool = False,
+):
     """
     Preprocess packed sequences
     CP splits sequence into CP*2 chunks, and each GPU gets 2 chunks (GPU0 gets first and last chunks, GPU1
@@ -313,10 +317,12 @@ def preprocess_thd_no_padding(
     # Pure Python int calculation to avoid further synchronization
     max_seqlen_in_batch = max(seqlens_in_batch_padded_cpu)
 
+    total_tokens = sum(seqlens_in_batch_padded_cpu)
     shape = list(input_ids.shape[1:])
-    shape[0] = sum(seqlens_in_batch_padded_cpu) // cp_size
+    shape[0] = total_tokens // cp_size
     if pre_process:
         input_ids_rmpad = torch.zeros(shape, dtype=input_ids.dtype, device=input_ids.device)
+        position_ids_rmpad = torch.zeros(shape[0], dtype=torch.long, device=input_ids.device)
         if need_roll:
             saved_roll_dict = {}
         for i in range(batch_size):
@@ -325,6 +331,9 @@ def preprocess_thd_no_padding(
                 seqlen = seqlens_in_batch_cpu[i]
                 start_idx = cu_seqlens_padded_cpu[i]
                 input_ids_rmpad[start_idx : start_idx + seqlen] = input_ids[i]
+                position_ids_rmpad[start_idx : start_idx + seqlen] = torch.arange(
+                    seqlen, dtype=torch.long, device=input_ids.device
+                )
                 continue
 
             seqlen_padded_i = seqlens_in_batch_padded_cpu[i]
@@ -333,9 +342,25 @@ def preprocess_thd_no_padding(
             start_idx = cu_seqlens_padded_cpu[i] // cp_size
             # split to 2 chunks
             d = input_ids[i]
+            # A sequence shorter than one TP*CP zig-zag alignment block does
+            # not contain enough source rows for the fixed-size first slice.
+            # Materialize its already-accounted-for padding before indexing.
+            if d.shape[0] < align_size:
+                pad = torch.zeros((align_size - d.shape[0], *d.shape[1:]), dtype=d.dtype, device=d.device)
+                d = torch.cat([d, pad], dim=0)
             input_ids_rmpad[start_idx : start_idx + half_seqlen] = d[
                 half_seqlen * cp_rank : half_seqlen * (cp_rank + 1)
             ]
+            first_start = half_seqlen * cp_rank
+            first_valid_end = min(half_seqlen * (cp_rank + 1), seqlens_in_batch_cpu[i])
+            first_valid_len = first_valid_end - first_start
+            if first_valid_len > 0:
+                position_ids_rmpad[start_idx : start_idx + first_valid_len] = torch.arange(
+                    first_start,
+                    first_valid_end,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
 
             remain_start = seqlen_padded_i - half_seqlen * (cp_rank + 1)
             remain_end = seqlen_padded_i - half_seqlen * cp_rank
@@ -345,6 +370,12 @@ def preprocess_thd_no_padding(
                 input_ids_rmpad[start_idx + half_seqlen : start_idx + half_seqlen + remain_len] = d[
                     remain_start:remain_end
                 ]
+                valid_pos_end = min(remain_end, seqlens_in_batch_cpu[i])
+                valid_pos_len = valid_pos_end - remain_start
+                if valid_pos_len > 0:
+                    position_ids_rmpad[start_idx + half_seqlen : start_idx + half_seqlen + valid_pos_len] = (
+                        torch.arange(remain_start, valid_pos_end, dtype=torch.long, device=input_ids.device)
+                    )
 
             if need_roll:
                 # Handle roll for cp_size > 1 case
@@ -361,6 +392,13 @@ def preprocess_thd_no_padding(
                 for k, v in saved_roll_dict.items():
                     input_ids_rmpad[k] = v
 
+    packed_seq_kwargs = {}
+    if include_total_tokens:
+        # Pinned MCore uses total_tokens to derive seq_idx. Hybrid/Mamba
+        # kernels consume seq_idx to reset recurrent state at packed sample
+        # boundaries, including when the global rows are sharded by CP.
+        packed_seq_kwargs["total_tokens"] = total_tokens
+
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
         cu_seqlens_q=cu_seqlens_padded,
@@ -369,11 +407,18 @@ def preprocess_thd_no_padding(
         max_seqlen_kv=max_seqlen_in_batch,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
+        **packed_seq_kwargs,
     )
     if pre_process:
-        return input_ids_rmpad.unsqueeze(0), packed_seq_params
-    else:
-        return input_ids, packed_seq_params
+        output = (input_ids_rmpad.unsqueeze(0), packed_seq_params)
+        if return_position_ids:
+            return (*output, position_ids_rmpad.unsqueeze(0))
+        return output
+
+    output = (input_ids, packed_seq_params)
+    if return_position_ids:
+        return (*output, None)
+    return output
 
 
 def postprocess_thd_no_padding(

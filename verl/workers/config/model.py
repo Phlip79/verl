@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -24,7 +25,39 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-__all__ = ["HFModelConfig"]
+__all__ = ["HFModelConfig", "MtpConfig"]
+
+
+@dataclass
+class MtpConfig(BaseConfig):
+    """Multi-token-prediction configuration shared by training and rollout.
+
+    ``enable`` controls whether MTP parameters are materialized. Native
+    Megatron-Core HybridModel checkpoints currently require ``enable_train``
+    whenever MTP is enabled; loading native MTP weights without running the
+    auxiliary training objective is deliberately rejected.
+
+    ``detach_encoder`` isolates the base-model hidden states from auxiliary MTP
+    gradients. For native HybridModel this maps to MCore's
+    ``mtp_detach_heads``. The ordinary language-model/policy loss is unaffected.
+    """
+
+    enable: bool = False
+    enable_train: bool = False
+    enable_rollout: bool = False
+
+    detach_encoder: bool = False
+    mtp_loss_scaling_factor: float = 0.1
+
+    # SGLang speculative decoding options.
+    speculative_algorithm: str = "EAGLE"
+    speculative_num_steps: int = 3
+    speculative_eagle_topk: int = 1
+    speculative_num_draft_tokens: int = 4
+
+    # vLLM speculative decoding options.
+    method: str = "mtp"
+    num_speculative_tokens: int = 1
 
 
 @dataclass
@@ -41,9 +74,11 @@ class HFModelConfig(BaseConfig):
         "architectures",
         "local_hf_config_path",
         "local_tokenizer_path",
+        "mtp",
     }
 
     path: str = MISSING
+    revision: Optional[str] = None
     local_path: Optional[str] = None
     hf_config_path: Optional[str] = None
     local_hf_config_path: Optional[str] = None
@@ -97,6 +132,16 @@ class HFModelConfig(BaseConfig):
 
     architectures: Optional[list[str]] = None
 
+    mtp: MtpConfig = field(default_factory=MtpConfig)
+
+    def _resolve_model_path(self) -> str:
+        model_path = os.path.expanduser(self.path)
+        if self.revision is not None and not os.path.exists(model_path) and not model_path.startswith("hdfs://"):
+            from huggingface_hub import snapshot_download
+
+            model_path = snapshot_download(repo_id=model_path, revision=self.revision)
+        return copy_to_local(model_path, use_shm=self.use_shm)
+
     def __post_init__(self):
         import_external_libs(self.external_lib)
 
@@ -105,11 +150,14 @@ class HFModelConfig(BaseConfig):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.path
 
-        self.local_path = copy_to_local(self.path, use_shm=self.use_shm)
+        self.local_path = self._resolve_model_path()
 
         # construct tokenizer
         if self.load_tokenizer:
-            self.local_tokenizer_path = copy_to_local(self.tokenizer_path, use_shm=self.use_shm)
+            if self.tokenizer_path == self.path:
+                self.local_tokenizer_path = self.local_path
+            else:
+                self.local_tokenizer_path = copy_to_local(self.tokenizer_path, use_shm=self.use_shm)
             self.tokenizer = hf_tokenizer(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
             self.processor = hf_processor(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
 
@@ -119,7 +167,10 @@ class HFModelConfig(BaseConfig):
             else:
                 self.tokenizer.chat_template = self.custom_chat_template
 
-        self.local_hf_config_path = copy_to_local(self.hf_config_path, use_shm=self.use_shm)
+        if self.hf_config_path == self.path:
+            self.local_hf_config_path = self.local_path
+        else:
+            self.local_hf_config_path = copy_to_local(self.hf_config_path, use_shm=self.use_shm)
         self.generation_config = get_generation_config(
             self.local_hf_config_path, trust_remote_code=self.trust_remote_code
         )
