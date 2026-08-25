@@ -193,6 +193,14 @@ def test_response_aware_mtp_mask_preserves_internal_zeroes(monkeypatch):
     assert _nested_rows(result) == [[0.0, 0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]
 
 
+def test_convert_to_nested_tensor_rejects_short_labels(monkeypatch):
+    model_forward, _ = _install_model_forward_dependencies(monkeypatch)
+    labels = torch.tensor([[10, 11, 12]])
+
+    with pytest.raises(ValueError, match="label length 3 is shorter than input length 4"):
+        model_forward._convert_to_nested_tensor(labels, [4])
+
+
 def test_native_thd_forward_keeps_mtp_mask_unshifted(monkeypatch):
     model_forward, _ = _install_model_forward_dependencies(monkeypatch)
     calls = []

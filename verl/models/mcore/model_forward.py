@@ -36,7 +36,7 @@ def _is_nested_tensor(value) -> bool:
 
 
 def _convert_to_nested_tensor(value, input_ids_lengths):
-    """Align a padded tensor to the jagged full-input lengths."""
+    """Align labels to jagged full-input lengths, trimming dense right-padding."""
 
     if _is_nested_tensor(value):
         return value
@@ -52,7 +52,10 @@ def _convert_to_nested_tensor(value, input_ids_lengths):
         if piece.shape[0] > target_len:
             piece = piece[:target_len]
         elif piece.shape[0] < target_len:
-            piece = torch.cat([piece, torch.ones(target_len - piece.shape[0], dtype=piece.dtype, device=piece.device)])
+            raise ValueError(
+                f"sample {i}: label length {piece.shape[0]} is shorter than input length {target_len}; "
+                "missing labels cannot be inferred"
+            )
         pieces.append(piece)
     return torch.nested.nested_tensor(pieces, layout=torch.jagged)
 
