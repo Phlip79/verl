@@ -1,7 +1,7 @@
 # Container-only compatibility overrides; upstream release/v0.9.0 still caps
-# Transformers<5.11. These pins match the source PR's training/rollout stack.
+# Transformers<5.11. Super VL's Bridge source pin needs Transformers>=5.15.
 torch==2.13.0+cu130
 torchvision==0.28.0+cu130
 torchaudio==2.11.0+cu130
-transformers==5.12.1
+transformers==5.20.1
 kernels>=0.14.1,<0.15

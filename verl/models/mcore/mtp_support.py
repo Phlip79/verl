@@ -89,7 +89,7 @@ def validate_nemotron_super_vl_config(hf_config, engine_config):
     except ImportError as error:
         raise RuntimeError(
             "Nemotron 3.5 Super VL requires Megatron-Bridge with Nemotron35SuperVLBridge and "
-            "expanded-sequence NemotronOmniModel support; the pinned Bridge 0.6.2 predates it. "
+            "expanded-sequence NemotronOmniModel support; released Bridge 0.6.2 predates it. "
             "See docs/advance/mtp.md for matching Bridge and Megatron-Core source revisions."
         ) from error
     if getattr(NemotronOmniModel, "model_owns_packing", True):

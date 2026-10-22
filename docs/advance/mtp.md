@@ -16,17 +16,18 @@ Currently, RL training can be performed on mimo-7B-RL, Qwen-next, and Deepseek s
 
     - For the legacy mbridge backend, apply the patches and review suggestions from [mbridge#62](https://github.com/ISEEKYAN/mbridge/pull/62). The Nemotron recipes use NVIDIA Megatron-Bridge (`vanilla_mbridge=False`).
 
-    - The Lightning Dockerfile pins Megatron-Bridge **0.6.2**, Megatron-Core **0.19.2**, vLLM **0.29.0**, and Transformers **5.12.1**. Unlike upstream `main`, `release/v0.9.0` has no `uv.lock`; the Dockerfile installs these versions explicitly and overrides the release's Transformers upper bound for this isolated model environment. This version set provides the native `HybridModel` and R3+MTP capabilities required by the Lightning recipes. Bridge 0.6.2 does not register Nemotron 3.5 Super VL; that recipe requires the newer Bridge/Core pair listed in section 7.
+    - The Nemotron image pins Megatron-Bridge source revision **e97a67ac**, the matching Megatron-Core revision **89b28875**, vLLM **0.29.0**, and Transformers **5.20.1**. The newer Bridge/Core pair supplies Super VL's expanded-sequence model wrapper as well as native `HybridModel` MTP. Unlike upstream `main`, `release/v0.9.0` has no `uv.lock`; the Dockerfile installs these dependencies explicitly and overrides the release's Transformers upper bound for this isolated model environment. Full image and GPU training validation are still pending.
 
-    - NVIDIA Nemotron 3.5 Lightning also provides an NGC-based image recipe in `docker/Dockerfile.nemotron_3_5_lightning`. From the repository root, build it with:
+    - `docker/Dockerfile.nemotron_3_5_lightning` retains its historical filename but now builds the shared NGC `26.06-py3` x86-64 environment for Super VL SFT and the Lightning recipes. It includes the Super VL launcher and Pokemon data-preparation script; no manual dependency upgrade is needed inside the resulting image. From the repository root, build it with:
 
       ```bash
-      docker build --build-arg VERL_COMMIT="$(git rev-parse HEAD)" \
+      docker buildx build --platform linux/amd64 --load \
+        --build-arg VERL_COMMIT="$(git rev-parse HEAD)" \
         -f docker/Dockerfile.nemotron_3_5_lightning \
-        -t verl-nemotron-3-5-lightning .
+        -t gitlab-master.nvidia.com:5005/ppetrakian/containers/verl/super:base .
       ```
 
-      `VERL_COMMIT` records the source revision in the image metadata; the Docker build uses the current build context, so build from a clean checkout of that revision.
+      `VERL_COMMIT` records the source revision in the image metadata; the Docker build uses the current build context, so build from a clean checkout of that revision. `--load` makes the image available locally for `docker run` and `docker push`. Build-time checks verify the source revisions, native MTP kernels, Super VL wrapper contract, and required example files; they do not substitute for GPU training validation.
 
       For an immutable Lightning run, download the model and GRPO datasets at the validated revisions before launching:
 
@@ -65,7 +66,7 @@ For native Megatron-Core `HybridModel` models, `enable=True` requires `enable_tr
 
 `detach_encoder=True` applies only to the auxiliary MTP branch. It prevents MTP-loss gradients from flowing back through the base-model hidden states, but it does not freeze the base model: the ordinary SFT language-model loss continues to train it.
 
-When vLLM rollout uses R3 router replay together with MTP speculation, vLLM **0.26.0 or newer** is required so replay excludes draft-model router decisions. The Lightning image uses vLLM 0.29.0. R3 also requires `actor_rollout_ref.rollout.enable_rollout_routing_replay=True` and context parallelism 1 for the validated Lightning topology.
+When vLLM rollout uses R3 router replay together with MTP speculation, vLLM **0.26.0 or newer** is required so replay excludes draft-model router decisions. The Nemotron image uses vLLM 0.29.0. R3 also requires `actor_rollout_ref.rollout.enable_rollout_routing_replay=True` and context parallelism 1 for the validated Lightning topology.
 
 ## 3. Experimental Results
 
@@ -162,16 +163,9 @@ Use `examples/sft/vlm/run_nemotron_3_5_super_vl_megatron.sh` with `nvidia/NVIDIA
 
 Super VL needs Bridge's expanded-sequence `NemotronOmniModel`: the processor expands image placeholders, verl packs the complete sequence, and Bridge replaces image positions with projected features without changing token lengths. verl forwards image sizes and one-frame metadata, preserves Mamba sequence boundaries, and uses the nested decoder's native MTP loss path. Images with different resolutions are converted to RADIO patches before batching.
 
-The stable Bridge 0.6.2 / Core 0.19.2 pair and the Lightning Docker image do not provide this model. Use a separate environment with [Bridge revision `e97a67ac`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/commit/e97a67acbf1b7a8ae0a0e0f26c60fa9548e19bfe) and its matching [Megatron-Core revision `89b28875`](https://github.com/NVIDIA/Megatron-LM/commit/89b28875a8d786ab41333bc60e7e8022e83e8f65). Installing the newer Bridge alone over Core 0.19.2 is insufficient because Bridge imports newer Core APIs. Starting from the Lightning image environment, install both source revisions:
+The Dockerfile in section 1 installs [Bridge revision `e97a67ac`](https://github.com/NVIDIA-NeMo/Megatron-Bridge/commit/e97a67acbf1b7a8ae0a0e0f26c60fa9548e19bfe) and its matching [Megatron-Core revision `89b28875`](https://github.com/NVIDIA/Megatron-LM/commit/89b28875a8d786ab41333bc60e7e8022e83e8f65), so Super VL no longer requires a manual upgrade after building the image. Released Bridge 0.6.2 does not register this model, and installing the newer Bridge alone over Core 0.19.2 is insufficient because it imports newer Core APIs. For a non-container environment, use the same source pair and runtime dependencies as the Dockerfile rather than mixing the older release packages with the newer Bridge.
 
-```bash
-uv pip install --no-deps \
-  'megatron-core @ git+https://github.com/NVIDIA/Megatron-LM.git@89b28875a8d786ab41333bc60e7e8022e83e8f65' \
-  'megatron-bridge @ git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@e97a67acbf1b7a8ae0a0e0f26c60fa9548e19bfe'
-uv pip install --no-deps 'transformers==5.20.1'
-```
-
-Use Transformers 5.20.1 and `model.trust_remote_code=True` to use the checkpoint's processor within the newer Bridge's supported Transformers range. Launch with the environment's Python. This deliberately overrides the release's `transformers<5.11` requirement for Super VL; reinstalling verl with dependency resolution can restore an incompatible Transformers version. These source revisions establish the required interfaces; the combined verl environment still needs a GPU smoke test.
+The image includes Transformers 5.20.1; the launcher sets `model.trust_remote_code=True` for the checkpoint's processor. This deliberately overrides the release's `transformers<5.11` requirement for Super VL; reinstalling verl with dependency resolution can restore an incompatible Transformers version. The source pair and build-time checks establish the required interfaces, but full image and GPU training validation are still pending.
 
 Prepare an image-caption dataset and run once on each host with a distinct `NODE_RANK`:
 

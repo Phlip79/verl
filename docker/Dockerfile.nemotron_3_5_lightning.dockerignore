@@ -7,11 +7,14 @@
 !examples
 !examples/data_preprocess
 !examples/data_preprocess/gsm8k_multiturn_sft.py
+!examples/data_preprocess/pokemon.py
 !examples/grpo_trainer
 !examples/grpo_trainer/run_nemotron_3_5_lightning_30b_a3b_megatron.sh
 !examples/sft
 !examples/sft/gsm8k
 !examples/sft/gsm8k/run_nemotron_3_5_lightning_megatron.sh
+!examples/sft/vlm
+!examples/sft/vlm/run_nemotron_3_5_super_vl_megatron.sh
 !verl
 !verl/**
 !docker

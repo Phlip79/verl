@@ -10,13 +10,13 @@
 #     bash examples/sft/gsm8k/run_nemotron_3_5_lightning_megatron.sh
 #
 # Dependency set pinned by docker/Dockerfile.nemotron_3_5_lightning:
-#   Megatron-Bridge 0.6.2
-#   Megatron-Core 0.19.2
-#   Transformers 5.12.1
+#   Megatron-Bridge e97a67ac (source revision shared with Super VL)
+#   Megatron-Core 89b28875 (matching source revision)
+#   Transformers 5.20.1
 #   vLLM 0.29.0
 #
-# Use the Bridge 0.6.2 / MCore 0.19.2 pair pinned by the Dockerfile. The public
-# Lightning checkpoint revision used for hardware validation is:
+# The updated image dependency set still needs GPU validation. The public
+# Lightning checkpoint revision used for earlier hardware validation is:
 #   d468880b6ad3c6e0d21377ce7242adaea4cc884d
 
 set -xeuo pipefail

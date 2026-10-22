@@ -12,11 +12,11 @@
 # topology. Run this script once on the head of an already-started Ray cluster.
 #
 # Dependency set pinned by docker/Dockerfile.nemotron_3_5_lightning:
-#   Megatron-Bridge 0.6.2
-#   Megatron-Core 0.19.2
-#   Transformers 5.12.1
+#   Megatron-Bridge e97a67ac (source revision shared with Super VL)
+#   Megatron-Core 89b28875 (matching source revision)
+#   Transformers 5.20.1
 #   vLLM 0.29.0
-# The four-hour hardware soak predated these final upstream pins, so run a GPU
+# The four-hour hardware soak predated these image dependency pins, so run a GPU
 # smoke test before treating this release backport as hardware-qualified.
 #
 # Use the BF16 customization checkpoint. Quantized Lightning checkpoints and

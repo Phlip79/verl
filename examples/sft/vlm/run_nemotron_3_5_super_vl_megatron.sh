@@ -7,10 +7,10 @@
 # NODE_RANK in [0, 3], for example:
 #   MASTER_ADDR=<node-0-hostname> NODE_RANK=0 bash examples/sft/vlm/run_nemotron_3_5_super_vl_megatron.sh
 #
-# Requires a Super-VL-capable Megatron-Bridge with the expanded-sequence model
-# wrapper. Bridge 0.6.2 in the Lightning image predates this model; see docs/advance/mtp.md
-# for the matching Bridge/Core source revisions to install. Use
-# trust_remote_code=True with the checkpoint's processor on Transformers 5.20.1.
+# docker/Dockerfile.nemotron_3_5_lightning includes the expanded-sequence model
+# wrapper with Bridge e97a67ac / Core 89b28875 and Transformers 5.20.1.
+# No manual dependency upgrade is needed in that image; see docs/advance/mtp.md
+# for the build command. Use trust_remote_code=True with the checkpoint's processor.
 # Image/text training only, CP=1. GPU validation of this recipe is pending.
 
 set -xeuo pipefail
