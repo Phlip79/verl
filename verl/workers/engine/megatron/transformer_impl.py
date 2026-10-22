@@ -321,6 +321,9 @@ class MegatronEngine(BaseEngine):
             )
         self.provider = None
         self.vanilla_bridge = self.engine_config.vanilla_mbridge
+        from verl.models.mcore.mtp_support import validate_nemotron_super_vl_config
+
+        validate_nemotron_super_vl_config(self.model_config.hf_config, self.engine_config)
 
         if self.vanilla_bridge:
             from verl.models.mcore.mbridge import AutoBridge
@@ -363,6 +366,10 @@ class MegatronEngine(BaseEngine):
             }
             for key, value in override_transformer_config.items():
                 provider_overrides[key] = value
+
+            from verl.models.mcore.mtp_support import configure_native_hybrid_mtp
+
+            configure_native_hybrid_mtp(provider, self.model_config.mtp, provider_overrides)
             if (
                 self.model_config.hf_config.model_type == "deepseek_v4"
                 and not self.model_config.mtp.enable
