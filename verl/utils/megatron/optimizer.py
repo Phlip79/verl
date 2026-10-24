@@ -123,12 +123,15 @@ def init_megatron_optim_config(
     fp16: bool = False,
     bf16: bool = True,
 ) -> OptimizerConfig:
+    adam_beta1, adam_beta2 = optim_config.get("betas", (0.9, 0.999))
     optim_args = {
         "optimizer": optim_config.optimizer,
         "lr": optim_config.lr,
         "min_lr": optim_config.min_lr,
         "clip_grad": optim_config.clip_grad,
         "weight_decay": optim_config.weight_decay,
+        "adam_beta1": adam_beta1,
+        "adam_beta2": adam_beta2,
         "use_distributed_optimizer": use_distributed_optimizer,
     }
     if str(optim_config.optimizer).lower() in _MUON_ALGORITHMS:
