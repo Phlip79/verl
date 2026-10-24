@@ -87,6 +87,19 @@ def _load_megatron_utils_with_stubs(monkeypatch):
     class Float16Module:
         pass
 
+    class FullyShardedDataParallelV1:
+        pass
+
+    class FullyShardedDataParallelV2:
+        pass
+
+    class MegatronFSDP:
+        pass
+
+    def fully_sharded_data_parallel_factory(*args, **kwargs):
+        del args, kwargs
+        return FullyShardedDataParallelV2()
+
     class ModelType:
         encoder_or_decoder = object()
 
@@ -118,10 +131,28 @@ def _load_megatron_utils_with_stubs(monkeypatch):
     megatron = stub_module("megatron", core=core)
     megatron.__path__ = []
     core.__path__ = []
-    stub_module(
+    distributed = stub_module(
         "megatron.core.distributed",
         DistributedDataParallel=DistributedDataParallel,
         DistributedDataParallelConfig=object,
+        finalize_model_grads=lambda *args, **kwargs: None,
+    )
+    distributed.__path__ = []
+    fsdp = stub_module("megatron.core.distributed.fsdp")
+    fsdp.__path__ = []
+    stub_module(
+        "megatron.core.distributed.fsdp.mcore_fsdp_adapter",
+        FullyShardedDataParallel=fully_sharded_data_parallel_factory,
+        FullyShardedDataParallelV1=FullyShardedDataParallelV1,
+        FullyShardedDataParallelV2=FullyShardedDataParallelV2,
+    )
+    fsdp_src = stub_module("megatron.core.distributed.fsdp.src")
+    fsdp_src.__path__ = []
+    megatron_fsdp_package = stub_module("megatron.core.distributed.fsdp.src.megatron_fsdp")
+    megatron_fsdp_package.__path__ = []
+    stub_module(
+        "megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp",
+        MegatronFSDP=MegatronFSDP,
     )
     stub_module("megatron.core.enums", ModelType=ModelType)
     stub_module("megatron.core.optimizer", ChainedOptimizer=object)
@@ -134,7 +165,11 @@ def _load_megatron_utils_with_stubs(monkeypatch):
     transformer.__path__ = []
     stub_module("megatron.core.transformer.module", Float16Module=Float16Module)
     stub_module("megatron.core.transformer.multi_token_prediction", MTPLossLoggingHelper=object)
-    stub_module("megatron.core.utils", get_attr_wrapped_model=lambda model, *args, **kwargs: model)
+    stub_module(
+        "megatron.core.utils",
+        get_attr_wrapped_model=lambda model, *args, **kwargs: model,
+        get_model_config=lambda model: model.config,
+    )
 
     stub_module("tensordict", TensorDict=object)
     stub_module("transformers", PretrainedConfig=object)
@@ -155,6 +190,39 @@ def _load_megatron_utils_with_stubs(monkeypatch):
         "verl.utils.megatron_utils_native_mtp_test",
         "verl/utils/megatron_utils.py",
     )
+
+
+def test_megatron_fsdp_factory_is_not_registered_as_wrapper_type(monkeypatch):
+    megatron_utils = _load_megatron_utils_with_stubs(monkeypatch)
+
+    assert all(isinstance(wrapper, type) for wrapper in megatron_utils.ALL_MODULE_WRAPPER_CLASSNAMES)
+    assert {wrapper.__name__ for wrapper in megatron_utils.MEGATRON_FSDP_WRAPPER_CLASSES} == {
+        "FullyShardedDataParallelV1",
+        "FullyShardedDataParallelV2",
+        "MegatronFSDP",
+    }
+
+    wrapper_type = megatron_utils.MEGATRON_FSDP_WRAPPER_CLASSES[0]
+    wrapped = wrapper_type()
+    wrapped.module = object()
+    assert megatron_utils.unwrap_model(wrapped) is wrapped.module
+
+
+def test_register_training_hooks_accepts_fsdp_factory_api(monkeypatch):
+    megatron_utils = _load_megatron_utils_with_stubs(monkeypatch)
+    ddp_type = megatron_utils.MEGATRON_DATA_PARALLEL_WRAPPER_CLASSES[0]
+    model = ddp_type()
+    model.config = SimpleNamespace(no_sync_func=None)
+    model.ddp_config = SimpleNamespace(overlap_grad_reduce=False, align_param_gather=False)
+    optimizer = SimpleNamespace(
+        scale_loss=lambda loss: loss,
+        config=SimpleNamespace(overlap_param_gather=False),
+    )
+
+    megatron_utils.register_megatron_training_hooks([model], optimizer)
+
+    assert model.config.grad_scale_func is optimizer.scale_loss
+    assert model.config.finalize_model_grads_func is not None
 
 
 def _nested(rows):
