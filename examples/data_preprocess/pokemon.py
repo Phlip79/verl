@@ -20,6 +20,12 @@ if __name__ == "__main__":
         default="~/data/pokemon-gpt4o-captions",
         help="The save directory for the preprocessed dataset.",
     )
+    parser.add_argument(
+        "--dataset_revision",
+        default=None,
+        help="Optional Hugging Face dataset revision used to make preprocessing reproducible.",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Seed used for the train/test split.")
 
     args = parser.parse_args()
     local_dataset_path = args.local_dataset_path
@@ -33,6 +39,7 @@ if __name__ == "__main__":
     else:
         dataset = datasets.load_dataset(
             data_source,
+            revision=args.dataset_revision,
         )
 
     def map_fn(row: dict):
@@ -56,7 +63,7 @@ if __name__ == "__main__":
         return row
 
     dataset = dataset["train"].map(map_fn, num_proc=16)
-    dataset = dataset.train_test_split(test_size=0.1)
+    dataset = dataset.train_test_split(test_size=0.1, seed=args.seed)
     train_dataset = dataset["train"]
     test_dataset = dataset["test"]
 
@@ -66,6 +73,8 @@ if __name__ == "__main__":
         print("Warning: Argument 'local_dir' is deprecated. Please use 'local_save_dir' instead.")
     else:
         local_save_dir = args.local_save_dir
+    local_save_dir = os.path.abspath(os.path.expanduser(local_save_dir))
+    os.makedirs(local_save_dir, exist_ok=True)
 
     train_dataset.to_parquet(os.path.join(local_save_dir, "train.parquet"))
     test_dataset.to_parquet(os.path.join(local_save_dir, "test.parquet"))

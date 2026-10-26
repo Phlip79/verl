@@ -178,6 +178,14 @@ def test_basic_optim_config_fields_pass_through(captured_args):
     assert captured_args["weight_decay"] == pytest.approx(0.1)
 
 
+def test_adam_betas_pass_through(captured_args):
+    cfg = _base_optim_config(betas=[0.9, 0.95])
+    init_megatron_optim_config(cfg)
+
+    assert captured_args["adam_beta1"] == pytest.approx(0.9)
+    assert captured_args["adam_beta2"] == pytest.approx(0.95)
+
+
 def test_override_optimizer_config_overrides_branch_defaults(captured_args):
     cfg = _precision_aware_optim_config(
         override_optimizer_config={
