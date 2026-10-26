@@ -8,10 +8,12 @@
 #   MASTER_ADDR=<node-0-hostname> NODE_RANK=0 bash examples/sft/vlm/run_nemotron_3_5_super_vl_megatron.sh
 #
 # docker/Dockerfile.nemotron_3_5_lightning includes the expanded-sequence model
-# wrapper with Bridge e97a67ac / Core 89b28875 and Transformers 5.20.1.
-# No manual dependency upgrade is needed in that image; see docs/advance/mtp.md
-# for the build command. Use trust_remote_code=True with the checkpoint's processor.
-# Image/text training only, CP=1. GPU validation of this recipe is pending.
+# wrapper and required runtime dependencies. No manual dependency upgrade is
+# needed in that image. Use trust_remote_code=True with the checkpoint's
+# processor. Image/text training only, CP=1.
+#
+# This recipe was validated on 4 nodes x 8 H100 GPUs for 692 optimizer steps,
+# final held-out evaluation, full checkpoint save, and next-step resume.
 
 set -xeuo pipefail
 
@@ -30,6 +32,7 @@ PYTHON_BIN=${PYTHON_BIN:-python}
 # ============================================================
 # Prepare image-caption conversations with:
 #   python examples/data_preprocess/pokemon.py \
+#     --dataset_revision 9a488d4d9a3285ba112b531fe0942fa1c3931bd8 \
 #     --local_save_dir "$HOME/data/pokemon-gpt4o-captions"
 # Custom parquet data must contain messages and images; use <image> in messages.
 DATASET_DIR=${DATASET_DIR:-${HOME}/data/pokemon-gpt4o-captions}
@@ -55,10 +58,26 @@ MAX_LENGTH=${MAX_LENGTH:-8192}
 MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-${MAX_LENGTH}}
 LR=${LR:-5e-6}
 MIN_LR=${MIN_LR:-5e-7}
+LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-10}
 DTYPE=${DTYPE:-bfloat16}
+
+TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:--1}
+VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:--1}
+NUM_WORKERS=${NUM_WORKERS:-2}
+
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-null}
+TEST_FREQ=${TEST_FREQ:-after_each_epoch}
+SAVE_FREQ=${SAVE_FREQ:-200}
+MAX_CKPT_TO_KEEP=${MAX_CKPT_TO_KEEP:-10}
+CHECKPOINT_ASYNC_SAVE=${CHECKPOINT_ASYNC_SAVE:-False}
+CHECKPOINT_SAVE_CONTENTS=${CHECKPOINT_SAVE_CONTENTS:-"[model,optimizer,extra]"}
+CHECKPOINT_LOAD_CONTENTS=${CHECKPOINT_LOAD_CONTENTS:-"[model,optimizer,extra]"}
+USE_CHECKPOINT_OPT_PARAM_SCHEDULER=${USE_CHECKPOINT_OPT_PARAM_SCHEDULER:-True}
 
 BACKEND=${BACKEND:-megatron}
 RESUME_MODE=${RESUME_MODE:-auto}
+RESUME_FROM_PATH=${RESUME_FROM_PATH:-null}
 PROJECT_NAME=${PROJECT_NAME:-verl_sft_nemotron_super_vl}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-nemotron-3-5-super-vl-${BACKEND}-tp${TP_SIZE}-pp${PP_SIZE}-cp${CP_SIZE}-ep${EP_SIZE}}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-${HOME}/verl/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
@@ -80,12 +99,13 @@ MEGATRON_ENGINE_CONFIG=(
     "optim=${BACKEND}"
     "optim.lr=${LR}"
     "optim.min_lr=${MIN_LR}"
-    "optim.lr_warmup_steps=10"
+    "optim.lr_warmup_steps=${LR_WARMUP_STEPS}"
     "optim.weight_decay=0.1"
     "optim.betas=[0.9,0.95]"
     "optim.clip_grad=1.0"
     "optim.lr_warmup_init=0"
     "optim.lr_decay_style=cosine"
+    "optim.use_checkpoint_opt_param_scheduler=${USE_CHECKPOINT_OPT_PARAM_SCHEDULER}"
     "+optim.override_optimizer_config.optimizer_offload_fraction=1"
     "+optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True"
     "+optim.override_optimizer_config.use_precision_aware_optimizer=True"
@@ -155,6 +175,9 @@ MEGATRON_ENGINE_CONFIG=(
     "data.truncation=error" \
     "data.use_dynamic_bsz=True" \
     "data.max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}" \
+    "data.train_max_samples=${TRAIN_MAX_SAMPLES}" \
+    "data.val_max_samples=${VAL_MAX_SAMPLES}" \
+    "data.num_workers=${NUM_WORKERS}" \
     "data.messages_key=messages" \
     "+data.image_key=images" \
     "data.ignore_input_ids_mismatch=True" \
@@ -167,14 +190,18 @@ MEGATRON_ENGINE_CONFIG=(
     "model.mtp.detach_encoder=${MTP_DETACH_ENCODER}" \
     "model.mtp.mtp_loss_scaling_factor=${MTP_LOSS_SCALING_FACTOR}" \
     "${MEGATRON_ENGINE_CONFIG[@]}" \
-    "trainer.test_freq=after_each_epoch" \
-    "trainer.save_freq=200" \
+    "trainer.test_freq=${TEST_FREQ}" \
+    "trainer.save_freq=${SAVE_FREQ}" \
     'trainer.logger=["console","wandb"]' \
     "trainer.project_name=${PROJECT_NAME}" \
     "trainer.experiment_name=${EXPERIMENT_NAME}" \
-    "trainer.total_epochs=1" \
+    "trainer.total_epochs=${TOTAL_EPOCHS}" \
+    "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}" \
     "trainer.default_local_dir=${CHECKPOINT_DIR}" \
     "trainer.resume_mode=${RESUME_MODE}" \
-    "trainer.max_ckpt_to_keep=10" \
-    "checkpoint.save_contents=[model,optimizer,extra]" \
+    "trainer.resume_from_path=${RESUME_FROM_PATH}" \
+    "trainer.max_ckpt_to_keep=${MAX_CKPT_TO_KEEP}" \
+    "+checkpoint.async_save=${CHECKPOINT_ASYNC_SAVE}" \
+    "checkpoint.save_contents=${CHECKPOINT_SAVE_CONTENTS}" \
+    "checkpoint.load_contents=${CHECKPOINT_LOAD_CONTENTS}" \
     "$@"

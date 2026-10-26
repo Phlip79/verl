@@ -544,9 +544,7 @@ def _get_megatron_fsdp_wrapper_classes() -> tuple[type, ...]:
 
 MEGATRON_FSDP_WRAPPER_CLASSES = _get_megatron_fsdp_wrapper_classes()
 MEGATRON_DATA_PARALLEL_WRAPPER_CLASSES = tuple(dict.fromkeys((DDP, *MEGATRON_FSDP_WRAPPER_CLASSES)))
-ALL_MODULE_WRAPPER_CLASSNAMES = tuple(
-    dict.fromkeys((DDP, Float16Module, *MEGATRON_FSDP_WRAPPER_CLASSES))
-)
+ALL_MODULE_WRAPPER_CLASSNAMES = tuple(dict.fromkeys((DDP, Float16Module, *MEGATRON_FSDP_WRAPPER_CLASSES)))
 
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
